@@ -220,7 +220,7 @@ class PlateTracker:
         frame_idx: int = 0,
         obj_id: str = "plate",
         offload_video_to_cpu: bool = True,
-    ) -> List[TrajectoryPoint]:
+    ) -> tuple[List[TrajectoryPoint], List[RepSegment]]:
         predictor, state = self._init_state(
             video_path,
             candidate,
@@ -264,7 +264,7 @@ class PlateTracker:
 
         rep_segments = self._segment_repetitions(trajectory)
         self._export_visualizations(video_path, trajectory, rep_segments, output_dir_path)
-        return trajectory
+        return trajectory, rep_segments
 
     def _export_visualizations(
         self,
@@ -307,6 +307,8 @@ class PlateTracker:
 
         frame_idx = 0
         fade_frames = max(15, int(round(fps * 0.5)))
+        trajectory_idx = 0
+        latest_point: TrajectoryPoint | None = None
         while True:
             ok, frame = cap.read()
             if not ok:
@@ -324,6 +326,9 @@ class PlateTracker:
                     continue
                 start_f, end_f = rep_frame_bounds[idx]
 
+                if frame_idx < start_f:
+                    continue
+
                 if current_rep == idx:
                     active_pts = [
                         (int(round(p.x)), int(round(p.y)))
@@ -338,9 +343,6 @@ class PlateTracker:
                             (0, 0, 255),
                             2,
                         )
-                    if active_pts:
-                        cx, cy = active_pts[-1]
-                        cv2.circle(overlay, (cx, cy), 6, (0, 255, 255), -1)
                     continue
 
                 if frame_idx <= end_f:
@@ -372,6 +374,15 @@ class PlateTracker:
                     2,
                 )
 
+            while trajectory_idx < len(trajectory) and trajectory[trajectory_idx].frame_idx <= frame_idx:
+                latest_point = trajectory[trajectory_idx]
+                trajectory_idx += 1
+
+            if latest_point is not None:
+                cx = int(round(latest_point.x))
+                cy = int(round(latest_point.y))
+                cv2.circle(overlay, (cx, cy), 6, (0, 255, 255), -1)
+
             frame = cv2.addWeighted(frame, 1.0, overlay, 1.0, 0)
             writer.write(frame)
             frame_idx += 1
@@ -379,19 +390,45 @@ class PlateTracker:
         cap.release()
         writer.release()
 
-        first_frame = self.load_first_frame(video_path)
+        self._export_rep_plots(rep_segments, output_dir)
+
+    def _export_rep_plots(self, rep_segments: Sequence[RepSegment], output_dir: Path) -> None:
+        try:
+            import matplotlib.pyplot as plt
+        except Exception:
+            return
+
+        if not rep_segments:
+            return
+
         for segment in rep_segments:
-            plot_path = output_dir / f"trajectory_rep_{segment.index + 1}.png"
-            annotated = first_frame.copy()
-            pts = [
-                (int(round(p.x)), int(round(p.y)))
-                for p in segment.points
-            ]
-            if pts:
-                cv2.polylines(annotated, [np.array(pts, dtype=np.int32)], False, (0, 0, 255), 2)
-                cv2.circle(annotated, pts[0], 8, (0, 255, 0), -1)
-                cv2.circle(annotated, pts[-1], 8, (0, 0, 255), -1)
-            cv2.imwrite(str(plot_path), annotated)
+            if not segment.points:
+                continue
+            xs = [p.x for p in segment.points]
+            ys = [p.y for p in segment.points]
+            times = [p.time_s for p in segment.points]
+            plot_path = output_dir / f"trajectory_plot_rep_{segment.index + 1}.png"
+            fig, (ax_path, ax_height) = plt.subplots(1, 2, figsize=(10, 4))
+
+            ax_path.plot(xs, ys, color="tab:red", linewidth=2)
+            ax_path.scatter(xs[0], ys[0], color="tab:green", label="start")
+            ax_path.scatter(xs[-1], ys[-1], color="tab:red", label="end")
+            ax_path.set_title(f"Rep {segment.index + 1} path")
+            ax_path.set_xlabel("X (px)")
+            ax_path.set_ylabel("Y (px)")
+            ax_path.invert_yaxis()
+            ax_path.legend(loc="best")
+
+            ax_height.plot(times, ys, color="tab:blue", linewidth=2)
+            ax_height.set_title("Vertical position over time")
+            ax_height.set_xlabel("Time (s)")
+            ax_height.set_ylabel("Y (px)")
+            ax_height.invert_yaxis()
+            ax_height.grid(True, linestyle="--", linewidth=0.5, alpha=0.5)
+
+            fig.tight_layout()
+            fig.savefig(str(plot_path))
+            plt.close(fig)
 
     def _segment_repetitions(
         self,
@@ -425,21 +462,8 @@ class PlateTracker:
                 )
             ]
 
-        maxima, minima = self._peak_detect(smoothed, delta)
-        extrema = sorted([(idx, "max") for idx in maxima] + [(idx, "min") for idx in minima])
-
-        segments_by_type: dict[str, List[Tuple[int, int]]] = {"max": [], "min": []}
-        last_index: dict[str, Optional[int]] = {"max": None, "min": None}
-        for idx, kind in extrema:
-            last = last_index[kind]
-            if last is not None and idx - last >= min_points:
-                segments_by_type[kind].append((last, idx))
-            last_index[kind] = idx
-
-        chosen_type = "max" if len(segments_by_type["max"]) >= len(segments_by_type["min"]) else "min"
-        segments = segments_by_type[chosen_type]
-
-        if not segments:
+        diffs = np.diff(smoothed)
+        if np.allclose(diffs, 0):
             return [
                 RepSegment(
                     index=0,
@@ -449,22 +473,83 @@ class PlateTracker:
                 )
             ]
 
-        rep_segments: List[RepSegment] = []
-        for start_idx, end_idx in segments:
-            end_idx = min(end_idx, len(trajectory) - 1)
-            if end_idx <= start_idx:
-                continue
-            points = list(trajectory[start_idx : end_idx + 1])
-            if len(points) < min_points:
-                continue
-            rep_segments.append(
+        directions = np.sign(diffs)
+        nonzero = np.nonzero(directions)[0]
+        if nonzero.size == 0:
+            return [
                 RepSegment(
-                    index=len(rep_segments),
-                    start_frame=points[0].frame_idx,
-                    end_frame=points[-1].frame_idx,
-                    points=points,
+                    index=0,
+                    start_frame=trajectory[0].frame_idx,
+                    end_frame=trajectory[-1].frame_idx,
+                    points=list(trajectory),
                 )
-            )
+            ]
+
+        first_dir = directions[nonzero[0]]
+        directions[: nonzero[0]] = first_dir
+        for i in range(1, len(directions)):
+            if directions[i] == 0:
+                directions[i] = directions[i - 1]
+
+        rep_segments: List[RepSegment] = []
+        current_points: List[TrajectoryPoint] = [trajectory[0]]
+        current_min = current_max = smoothed[0]
+        flip_count = 0
+        last_dir = directions[0]
+
+        for idx in range(1, len(trajectory)):
+            point = trajectory[idx]
+            current_points.append(point)
+            value = smoothed[min(idx, len(smoothed) - 1)]
+            current_min = float(min(current_min, value))
+            current_max = float(max(current_max, value))
+
+            if idx - 1 >= len(directions):
+                continue
+
+            current_dir = directions[idx - 1]
+            if current_dir != last_dir:
+                flip_count += 1
+                last_dir = current_dir
+
+            if flip_count >= 2:
+                amplitude = current_max - current_min
+                if len(current_points) >= min_points and amplitude >= delta:
+                    rep_segments.append(
+                        RepSegment(
+                            index=len(rep_segments),
+                            start_frame=current_points[0].frame_idx,
+                            end_frame=current_points[-1].frame_idx,
+                            points=list(current_points),
+                        )
+                    )
+                    current_points = [current_points[-1]]
+                    current_min = current_max = value
+                    flip_count = 0
+                else:
+                    flip_count = 1
+                    current_min = float(min(current_min, value))
+                    current_max = float(max(current_max, value))
+
+        if current_points:
+            amplitude = max(current_max - current_min, 0.0)
+            if rep_segments:
+                if len(current_points) > 1 and amplitude >= 0:
+                    last_segment = rep_segments[-1]
+                    # Avoid duplicating the shared starting point
+                    extra = current_points[1:]
+                    last_segment.points.extend(extra)
+                    if extra:
+                        last_segment.end_frame = extra[-1].frame_idx
+            elif len(current_points) >= min_points:
+                rep_segments.append(
+                    RepSegment(
+                        index=0,
+                        start_frame=current_points[0].frame_idx,
+                        end_frame=current_points[-1].frame_idx,
+                        points=list(current_points),
+                    )
+                )
 
         if not rep_segments:
             return [
@@ -488,40 +573,6 @@ class PlateTracker:
         padded = np.pad(values, (window // 2, window - 1 - window // 2), mode="edge")
         smoothed = np.convolve(padded, kernel, mode="valid")
         return smoothed.astype(np.float32)
-
-    @staticmethod
-    def _peak_detect(values: np.ndarray, delta: float) -> Tuple[List[int], List[int]]:
-        if values.size == 0:
-            return [], []
-        maxima: List[int] = []
-        minima: List[int] = []
-        mn = mx = values[0]
-        mn_pos = mx_pos = 0
-        look_for_max = True
-
-        for i, value in enumerate(values[1:], start=1):
-            if value > mx:
-                mx = value
-                mx_pos = i
-            if value < mn:
-                mn = value
-                mn_pos = i
-
-            if look_for_max:
-                if value < mx - delta:
-                    maxima.append(mx_pos)
-                    mn = value
-                    mn_pos = i
-                    look_for_max = False
-            else:
-                if value > mn + delta:
-                    minima.append(mn_pos)
-                    mx = value
-                    mx_pos = i
-                    look_for_max = True
-
-        return maxima, minima
-
 
 def trajectory_to_array(trajectory: Iterable[TrajectoryPoint]) -> np.ndarray:
     data = [(p.frame_idx, p.time_s, p.x, p.y) for p in trajectory]

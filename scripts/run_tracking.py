@@ -109,7 +109,7 @@ def main() -> int:
         print("Warning: unable to generate mask preview; proceeding with tracking", file=sys.stderr)
 
     print("Tracking in progress...")
-    trajectory = tracker.run(str(video_path), candidate, args.output)
+    trajectory, rep_segments = tracker.run(str(video_path), candidate, args.output)
     if not trajectory:
         print("No trajectory points generated", file=sys.stderr)
         return 4
@@ -118,7 +118,19 @@ def main() -> int:
     overlay_suffix = Path(video_path).suffix.lower() or ".mp4"
     overlay_name = f"trajectory_overlay{overlay_suffix}"
     print(f"Overlay video saved to {output_root / overlay_name}")
-    print(f"Plot saved to {output_root / 'trajectory_plot.png'}")
+    if rep_segments:
+        if len(rep_segments) == 1:
+            print(
+                "Trajectory plot saved to "
+                f"{output_root / f'trajectory_plot_rep_{rep_segments[0].index + 1}.png'}"
+            )
+        else:
+            first_plot = output_root / f"trajectory_plot_rep_{rep_segments[0].index + 1}.png"
+            last_plot = output_root / f"trajectory_plot_rep_{rep_segments[-1].index + 1}.png"
+            print(
+                "Trajectory plots saved from "
+                f"{first_plot} to {last_plot}"
+            )
     return 0
 
 

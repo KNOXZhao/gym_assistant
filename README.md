@@ -25,7 +25,7 @@ python scripts/run_tracking.py videos/squat.mov --output outputs/squat --preview
 The script saves a `coordinate_grid.jpg` next to the outputs to help you determine the plate coordinates. When prompted, enter the plate center as `x,y`, or pass it non-interactively via `--point X Y`. After you confirm the point, the tracker renders `mask_preview.png` so you can verify the segmented plate before processing the rest of the video. Results include:
 - `trajectory.csv`: frame index, time (s), and pixel coordinates of the plate center.
 - `mask_preview.png`: the SAM 2 mask overlay and computed centroid for the selected plate.
-- `trajectory_overlay.mov` (or `.mp4` if the input is MP4): the original video with each repetition highlighted while previous reps fade out.
-- `trajectory_rep_*.png`: per-repetition trajectory snapshots rendered on the first frame for side-by-side comparison.
+- `trajectory_overlay.mov` (or `.mp4` if the input is MP4): the original video with each repetition highlighted while previous reps fade out but the live tracking marker remains on the current frame.
+- `trajectory_plot_rep_*.png`: per-repetition trajectory plots that include the 2D plate path and vertical position over time for each move.
 
 Set `--device cuda` to run inference on GPU when available.
