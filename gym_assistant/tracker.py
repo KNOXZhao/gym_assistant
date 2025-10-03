@@ -25,6 +25,16 @@ class TrajectoryPoint:
     y: float
 
 
+@dataclass
+class RepSegment:
+    """Container for a single repetition extracted from the trajectory."""
+
+    index: int
+    start_frame: int
+    end_frame: int
+    points: List[TrajectoryPoint]
+
+
 class PlateTracker:
     """High-level interface for tracking a barbell plate across a video."""
 
@@ -252,13 +262,15 @@ class PlateTracker:
                 trajectory.append(point)
                 writer.writerow([frame_idx_out, f"{time_s:.6f}", f"{cx:.2f}", f"{cy:.2f}"])
 
-        self._export_visualizations(video_path, trajectory, output_dir_path)
+        rep_segments = self._segment_repetitions(trajectory)
+        self._export_visualizations(video_path, trajectory, rep_segments, output_dir_path)
         return trajectory
 
     def _export_visualizations(
         self,
         video_path: str,
         trajectory: Sequence[TrajectoryPoint],
+        rep_segments: Sequence[RepSegment],
         output_dir: Path,
     ) -> None:
         if not trajectory:
@@ -275,38 +287,240 @@ class PlateTracker:
         video_out_path = output_dir / f"trajectory_overlay{suffix}"
         writer = cv2.VideoWriter(str(video_out_path), fourcc, fps, (width, height))
 
-        points_by_frame = {p.frame_idx: p for p in trajectory}
-        path_points: List[Tuple[int, int]] = []
+        rep_points: List[List[Tuple[int, int]]] = []
+        rep_frame_bounds: List[Tuple[int, int]] = []
+
+        if not rep_segments:
+            rep_segments = [
+                RepSegment(
+                    index=0,
+                    start_frame=trajectory[0].frame_idx,
+                    end_frame=trajectory[-1].frame_idx,
+                    points=list(trajectory),
+                )
+            ]
+
+        for segment in rep_segments:
+            pts = [(int(round(p.x)), int(round(p.y))) for p in segment.points]
+            rep_points.append(pts)
+            rep_frame_bounds.append((segment.start_frame, segment.end_frame))
 
         frame_idx = 0
+        fade_frames = max(15, int(round(fps * 0.5)))
         while True:
             ok, frame = cap.read()
             if not ok:
                 break
-            if frame_idx in points_by_frame:
-                pt = points_by_frame[frame_idx]
-                path_points.append((int(pt.x), int(pt.y)))
-            if len(path_points) > 1:
-                cv2.polylines(frame, [np.array(path_points, dtype=np.int32)], False, (0, 0, 255), 2)
-            if path_points:
-                cx, cy = path_points[-1]
-                cv2.circle(frame, (cx, cy), 6, (0, 255, 255), -1)
+            overlay = np.zeros_like(frame)
+            current_rep: Optional[int] = None
+            for idx, (start_f, end_f) in enumerate(rep_frame_bounds):
+                if start_f <= frame_idx <= end_f:
+                    current_rep = idx
+                    break
+
+            for idx, segment in enumerate(rep_segments):
+                pts = rep_points[idx]
+                if not pts:
+                    continue
+                start_f, end_f = rep_frame_bounds[idx]
+
+                if current_rep == idx:
+                    active_pts = [
+                        (int(round(p.x)), int(round(p.y)))
+                        for p in segment.points
+                        if p.frame_idx <= frame_idx
+                    ]
+                    if len(active_pts) > 1:
+                        cv2.polylines(
+                            overlay,
+                            [np.array(active_pts, dtype=np.int32)],
+                            False,
+                            (0, 0, 255),
+                            2,
+                        )
+                    if active_pts:
+                        cx, cy = active_pts[-1]
+                        cv2.circle(overlay, (cx, cy), 6, (0, 255, 255), -1)
+                    continue
+
+                if frame_idx <= end_f:
+                    partial_pts = [
+                        (int(round(p.x)), int(round(p.y)))
+                        for p in segment.points
+                        if p.frame_idx <= frame_idx
+                    ]
+                    if len(partial_pts) > 1:
+                        cv2.polylines(
+                            overlay,
+                            [np.array(partial_pts, dtype=np.int32)],
+                            False,
+                            (0, 0, 200),
+                            2,
+                        )
+                    continue
+
+                frames_since_end = frame_idx - end_f
+                alpha = max(0.0, 1.0 - frames_since_end / fade_frames)
+                if alpha <= 0.0:
+                    continue
+                color = (0, 0, int(round(200 * alpha)))
+                cv2.polylines(
+                    overlay,
+                    [np.array(pts, dtype=np.int32)],
+                    False,
+                    color,
+                    2,
+                )
+
+            frame = cv2.addWeighted(frame, 1.0, overlay, 1.0, 0)
             writer.write(frame)
             frame_idx += 1
 
         cap.release()
         writer.release()
 
-        # Save a static plot of the trajectory on top of the first frame
         first_frame = self.load_first_frame(video_path)
-        plot_path = output_dir / "trajectory_plot.png"
-        plot_path.parent.mkdir(parents=True, exist_ok=True)
-        annotated = first_frame.copy()
-        if path_points:
-            cv2.polylines(annotated, [np.array(path_points, dtype=np.int32)], False, (0, 0, 255), 2)
-            cv2.circle(annotated, path_points[0], 8, (0, 255, 0), -1)
-            cv2.circle(annotated, path_points[-1], 8, (0, 0, 255), -1)
-        cv2.imwrite(str(plot_path), annotated)
+        for segment in rep_segments:
+            plot_path = output_dir / f"trajectory_rep_{segment.index + 1}.png"
+            annotated = first_frame.copy()
+            pts = [
+                (int(round(p.x)), int(round(p.y)))
+                for p in segment.points
+            ]
+            if pts:
+                cv2.polylines(annotated, [np.array(pts, dtype=np.int32)], False, (0, 0, 255), 2)
+                cv2.circle(annotated, pts[0], 8, (0, 255, 0), -1)
+                cv2.circle(annotated, pts[-1], 8, (0, 0, 255), -1)
+            cv2.imwrite(str(plot_path), annotated)
+
+    def _segment_repetitions(
+        self,
+        trajectory: Sequence[TrajectoryPoint],
+        min_points: int = 10,
+        min_delta: float = 5.0,
+    ) -> List[RepSegment]:
+        if not trajectory:
+            return []
+
+        if len(trajectory) <= 1:
+            point = trajectory[0]
+            return [RepSegment(index=0, start_frame=point.frame_idx, end_frame=point.frame_idx, points=list(trajectory))]
+
+        data = trajectory_to_array(trajectory)
+        x_vals = data[:, 2]
+        y_vals = data[:, 3]
+        x_range = float(x_vals.max() - x_vals.min())
+        y_range = float(y_vals.max() - y_vals.min())
+        primary_vals = y_vals if y_range >= x_range else x_vals
+
+        smoothed = self._moving_average(primary_vals, window=5)
+        delta = max(min_delta, 0.05 * float(smoothed.max() - smoothed.min()))
+        if delta <= 0:
+            return [
+                RepSegment(
+                    index=0,
+                    start_frame=trajectory[0].frame_idx,
+                    end_frame=trajectory[-1].frame_idx,
+                    points=list(trajectory),
+                )
+            ]
+
+        maxima, minima = self._peak_detect(smoothed, delta)
+        extrema = sorted([(idx, "max") for idx in maxima] + [(idx, "min") for idx in minima])
+
+        segments_by_type: dict[str, List[Tuple[int, int]]] = {"max": [], "min": []}
+        last_index: dict[str, Optional[int]] = {"max": None, "min": None}
+        for idx, kind in extrema:
+            last = last_index[kind]
+            if last is not None and idx - last >= min_points:
+                segments_by_type[kind].append((last, idx))
+            last_index[kind] = idx
+
+        chosen_type = "max" if len(segments_by_type["max"]) >= len(segments_by_type["min"]) else "min"
+        segments = segments_by_type[chosen_type]
+
+        if not segments:
+            return [
+                RepSegment(
+                    index=0,
+                    start_frame=trajectory[0].frame_idx,
+                    end_frame=trajectory[-1].frame_idx,
+                    points=list(trajectory),
+                )
+            ]
+
+        rep_segments: List[RepSegment] = []
+        for start_idx, end_idx in segments:
+            end_idx = min(end_idx, len(trajectory) - 1)
+            if end_idx <= start_idx:
+                continue
+            points = list(trajectory[start_idx : end_idx + 1])
+            if len(points) < min_points:
+                continue
+            rep_segments.append(
+                RepSegment(
+                    index=len(rep_segments),
+                    start_frame=points[0].frame_idx,
+                    end_frame=points[-1].frame_idx,
+                    points=points,
+                )
+            )
+
+        if not rep_segments:
+            return [
+                RepSegment(
+                    index=0,
+                    start_frame=trajectory[0].frame_idx,
+                    end_frame=trajectory[-1].frame_idx,
+                    points=list(trajectory),
+                )
+            ]
+
+        return rep_segments
+
+    @staticmethod
+    def _moving_average(values: np.ndarray, window: int = 5) -> np.ndarray:
+        if values.size == 0:
+            return values
+        if window <= 1 or values.size <= window:
+            return values.astype(np.float32)
+        kernel = np.ones(window, dtype=np.float32) / window
+        padded = np.pad(values, (window // 2, window - 1 - window // 2), mode="edge")
+        smoothed = np.convolve(padded, kernel, mode="valid")
+        return smoothed.astype(np.float32)
+
+    @staticmethod
+    def _peak_detect(values: np.ndarray, delta: float) -> Tuple[List[int], List[int]]:
+        if values.size == 0:
+            return [], []
+        maxima: List[int] = []
+        minima: List[int] = []
+        mn = mx = values[0]
+        mn_pos = mx_pos = 0
+        look_for_max = True
+
+        for i, value in enumerate(values[1:], start=1):
+            if value > mx:
+                mx = value
+                mx_pos = i
+            if value < mn:
+                mn = value
+                mn_pos = i
+
+            if look_for_max:
+                if value < mx - delta:
+                    maxima.append(mx_pos)
+                    mn = value
+                    mn_pos = i
+                    look_for_max = False
+            else:
+                if value > mn + delta:
+                    minima.append(mn_pos)
+                    mx = value
+                    mx_pos = i
+                    look_for_max = True
+
+        return maxima, minima
 
 
 def trajectory_to_array(trajectory: Iterable[TrajectoryPoint]) -> np.ndarray:
