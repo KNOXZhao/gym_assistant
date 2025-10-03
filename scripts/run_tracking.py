@@ -8,7 +8,7 @@ import sys
 from pathlib import Path
 
 
-from gym_assistant.detection import PlateCandidate
+from gym_assistant.detection import PlateCandidate, candidate_from_coordinates
 from gym_assistant.tracker import PlateTracker
 
 
@@ -34,18 +34,11 @@ def parse_args() -> argparse.Namespace:
         help="Torch device to run inference on (default: auto)",
     )
     parser.add_argument(
-        "--box",
-        type=int,
-        nargs=4,
-        metavar=("X1", "Y1", "X2", "Y2"),
-        help="Bounding box to initialize tracking (pixels)",
-    )
-    parser.add_argument(
-        "--center",
+        "--point",
         type=float,
-        nargs=3,
-        metavar=("CX", "CY", "RADIUS"),
-        help="Center and radius to initialize tracking (pixels)",
+        nargs=2,
+        metavar=("X", "Y"),
+        help="Pixel coordinate to seed SAM2 tracking",
     )
     parser.add_argument(
         "--preview",
@@ -66,28 +59,19 @@ def main() -> int:
     frame = tracker.load_first_frame(str(video_path))
 
     preview_path = Path(args.output) / "coordinate_grid.jpg"
-    if args.preview or (args.box is None and args.center is None):
+    if args.preview or args.point is None:
         tracker.save_coordinate_grid(frame, preview_path)
         print(f"Saved coordinate grid preview to {preview_path}")
 
     candidate: PlateCandidate
-    if args.box is not None:
+    if args.point is not None:
         try:
-            candidate = tracker.candidate_from_box(tuple(args.box))
+            candidate = candidate_from_coordinates(args.point)
         except ValueError as exc:
-            print(f"Invalid bounding box: {exc}", file=sys.stderr)
+            print(f"Invalid point: {exc}", file=sys.stderr)
             return 2
-    elif args.center is not None:
-        cx, cy, radius = args.center
-        if radius <= 0:
-            print("Radius must be positive.", file=sys.stderr)
-            return 2
-        candidate = PlateCandidate(center=(float(cx), float(cy)), radius=float(radius), score=float(radius))
     else:
-        print(
-            "Enter coordinates for the plate you want to track. "
-            "Provide either 'x1,y1,x2,y2' for a bounding box or 'cx,cy,radius' for a circle.",
-        )
+        print("Enter the (x,y) coordinate for the plate you want to track.")
         while True:
             try:
                 response = input("Coordinates: ").strip()
@@ -96,40 +80,26 @@ def main() -> int:
                 return 2
 
             if not response:
-                print("Please enter coordinates in one of the supported formats.")
+                print("Please enter the coordinate as 'x,y'.")
                 continue
 
             parts = [p.strip() for p in response.split(",")]
-            if len(parts) == 4:
+            if len(parts) == 2:
                 try:
-                    box = tuple(int(float(v)) for v in parts)
+                    point = tuple(float(v) for v in parts)
                 except ValueError:
-                    print("Invalid bounding box; please enter four numeric values.")
+                    print("Invalid coordinate; please enter two numeric values.")
                     continue
                 try:
-                    candidate = tracker.candidate_from_box(box)  # type: ignore[arg-type]
+                    candidate = candidate_from_coordinates(point)  # type: ignore[arg-type]
                 except ValueError as exc:
-                    print(f"Invalid bounding box: {exc}")
+                    print(f"Invalid point: {exc}")
                     continue
                 break
-            if len(parts) == 3:
-                try:
-                    cx, cy, radius = (float(v) for v in parts)
-                except ValueError:
-                    print("Invalid circle specification; please enter three numeric values.")
-                    continue
-                if radius <= 0:
-                    print("Radius must be positive.")
-                    continue
-                candidate = PlateCandidate(center=(cx, cy), radius=radius, score=radius)
-                break
 
-            print("Unrecognized format. Use 'x1,y1,x2,y2' or 'cx,cy,radius'.")
+            print("Unrecognized format. Use 'x,y'.")
 
-    print(
-        "Tracking with center=(%.1f, %.1f) and radius=%.1f"
-        % (candidate.center[0], candidate.center[1], candidate.radius)
-    )
+    print("Tracking from point=(%.1f, %.1f)" % (candidate.center[0], candidate.center[1]))
     trajectory = tracker.run(str(video_path), candidate, args.output)
     if not trajectory:
         print("No trajectory points generated", file=sys.stderr)

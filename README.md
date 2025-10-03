@@ -4,7 +4,7 @@ A minimal example for tracking the trajectory of a barbell plate using [SAM 2.1 
 
 ## Features
 - Generate a coordinate grid preview so you can read off approximate plate locations in pixel space.
-- Initialize SAM 2.1 tracking from manual coordinates (center + radius or bounding box) selected by the user.
+- Initialize SAM 2.1 tracking from a user-provided point that seeds the segmentation mask.
 - Export the plate trajectory as a CSV table along with an annotated video and static plot.
 
 ## Installation
@@ -22,7 +22,7 @@ Run the CLI on a squat or deadlift side-view video:
 python scripts/run_tracking.py videos/squat.mov --output outputs/squat --preview
 ```
 
-The script saves a `coordinate_grid.jpg` next to the outputs to help you determine the plate coordinates. When prompted, enter either `x1,y1,x2,y2` (bounding box) or `cx,cy,radius` (circle). You can also pass coordinates via the `--box` or `--center` arguments for non-interactive runs. Results include:
+The script saves a `coordinate_grid.jpg` next to the outputs to help you determine the plate coordinates. When prompted, enter the plate center as `x,y`, or pass it non-interactively via `--point X Y`. Results include:
 - `trajectory.csv`: frame index, time (s), and pixel coordinates of the plate center.
 - `trajectory_overlay.mov` (or `.mp4` if the input is MP4): the original video with the tracked path drawn on top.
 - `trajectory_plot.png`: a static visualization of the path on the first frame.

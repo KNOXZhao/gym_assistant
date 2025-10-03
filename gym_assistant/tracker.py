@@ -116,20 +116,6 @@ class PlateTracker:
 
         cv2.imwrite(str(output_path), preview)
 
-    @staticmethod
-    def candidate_from_box(box: Tuple[int, int, int, int]) -> PlateCandidate:
-        """Create a plate candidate from a bounding box."""
-
-        x1, y1, x2, y2 = box
-        x1, x2 = sorted((x1, x2))
-        y1, y2 = sorted((y1, y2))
-        cx = (x1 + x2) / 2.0
-        cy = (y1 + y2) / 2.0
-        radius = max(x2 - x1, y2 - y1) / 2.0
-        if radius <= 0:
-            raise ValueError("Bounding box must have positive width and height")
-        return PlateCandidate(center=(cx, cy), radius=radius, score=radius)
-
     def run(
         self,
         video_path: str,
@@ -146,8 +132,14 @@ class PlateTracker:
             offload_state_to_cpu=False,
         )
 
-        box = candidate.to_box(self.load_first_frame(video_path).shape)
-        predictor.add_new_points_or_box(state, frame_idx=frame_idx, obj_id=obj_id, box=box)
+        point_coords, point_labels = candidate.point_prompt()
+        predictor.add_new_points_or_box(
+            state,
+            frame_idx=frame_idx,
+            obj_id=obj_id,
+            points=point_coords,
+            labels=point_labels,
+        )
 
         frame_count, fps = self._video_metadata(video_path)
         if frame_count <= 0:
@@ -172,8 +164,11 @@ class PlateTracker:
                     mask_np = frame_mask.detach().cpu().numpy()
                 else:
                     mask_np = np.asarray(frame_mask)
+                mask_np = np.squeeze(mask_np)
                 if mask_np.dtype != np.bool_:
                     mask_np = mask_np > 0.5
+                if mask_np.ndim != 2:
+                    continue
                 ys, xs = np.nonzero(mask_np)
                 if len(xs) == 0:
                     continue
