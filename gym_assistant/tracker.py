@@ -462,7 +462,51 @@ class PlateTracker:
                 )
             ]
 
-        turning_points = self._find_turning_points(smoothed)
+        prominence = max(0.25 * min_delta, 0.01 * float(smoothed.max() - smoothed.min()), 1.0)
+
+        turning_points = self._find_turning_points(smoothed, prominence)
+        if not turning_points:
+            return [
+                RepSegment(
+                    index=0,
+                    start_frame=trajectory[0].frame_idx,
+                    end_frame=trajectory[-1].frame_idx,
+                    points=list(trajectory),
+                )
+            ]
+
+        diffs = np.diff(smoothed)
+        initial_sign = 0
+        for diff in diffs:
+            if abs(diff) >= 1e-3:
+                initial_sign = 1 if diff > 0 else -1
+                break
+
+        first_idx, first_type = turning_points[0]
+        if first_idx > 0:
+            if initial_sign < 0:
+                start_type = "max"
+            elif initial_sign > 0:
+                start_type = "min"
+            else:
+                start_type = "max" if first_type == "min" else "min"
+            turning_points.insert(0, (0, start_type))
+
+        last_idx, last_type = turning_points[-1]
+        if last_idx < len(smoothed) - 1:
+            final_sign = 0
+            for diff in reversed(diffs):
+                if abs(diff) >= 1e-3:
+                    final_sign = 1 if diff > 0 else -1
+                    break
+            if final_sign > 0:
+                end_type = "max"
+            elif final_sign < 0:
+                end_type = "min"
+            else:
+                end_type = "max" if last_type == "min" else "min"
+            turning_points.append((len(smoothed) - 1, end_type))
+
         if len(turning_points) < 3:
             return [
                 RepSegment(
@@ -477,29 +521,41 @@ class PlateTracker:
         idx = 0
         while idx <= len(turning_points) - 3:
             start_idx, start_type = turning_points[idx]
-            _, mid_type = turning_points[idx + 1]
-            end_idx, end_type = turning_points[idx + 2]
 
-            start_idx = int(start_idx)
-            end_idx = int(end_idx)
+            mid_idx = idx + 1
+            while mid_idx < len(turning_points) and turning_points[mid_idx][1] == start_type:
+                mid_idx += 1
+            if mid_idx >= len(turning_points):
+                break
 
-            if start_type == end_type and start_type != mid_type and end_idx > start_idx:
-                if end_idx >= len(trajectory):
-                    end_idx = len(trajectory) - 1
-                segment_points = list(trajectory[start_idx : end_idx + 1])
-                window_values = smoothed[start_idx : end_idx + 1]
-                amplitude = float(window_values.max() - window_values.min()) if window_values.size else 0.0
-                if len(segment_points) >= min_points and amplitude >= delta:
-                    rep_segments.append(
-                        RepSegment(
-                            index=len(rep_segments),
-                            start_frame=segment_points[0].frame_idx,
-                            end_frame=segment_points[-1].frame_idx,
-                            points=segment_points,
-                        )
+            end_idx = mid_idx + 1
+            while end_idx < len(turning_points) and turning_points[end_idx][1] != start_type:
+                end_idx += 1
+            if end_idx >= len(turning_points):
+                break
+
+            start_sample = int(turning_points[idx][0])
+            end_sample = int(turning_points[end_idx][0])
+            if end_sample <= start_sample:
+                idx += 1
+                continue
+
+            segment_points = list(trajectory[start_sample : end_sample + 1])
+            window_values = smoothed[start_sample : end_sample + 1]
+            amplitude = float(window_values.max() - window_values.min()) if window_values.size else 0.0
+
+            if len(segment_points) >= min_points and amplitude >= delta:
+                rep_segments.append(
+                    RepSegment(
+                        index=len(rep_segments),
+                        start_frame=segment_points[0].frame_idx,
+                        end_frame=segment_points[-1].frame_idx,
+                        points=segment_points,
                     )
-                    idx += 2
-                    continue
+                )
+                idx = end_idx
+                continue
+
             idx += 1
 
         if not rep_segments:
@@ -514,84 +570,39 @@ class PlateTracker:
 
         return rep_segments
 
-    def _find_turning_points(self, values: np.ndarray) -> List[Tuple[int, str]]:
-        if values.size == 0:
+    def _find_turning_points(self, values: np.ndarray, prominence: float) -> List[Tuple[int, str]]:
+        if values.size < 3:
             return []
 
-        diffs = np.diff(values)
-        if diffs.size == 0:
-            return []
+        window = min(5, max(1, values.size // 20))
+        turning_points: List[Tuple[int, str]] = []
 
-        signs = np.sign(diffs)
-        # Forward fill zeros with the last non-zero sign
-        last_nonzero = 0
-        for i, val in enumerate(signs):
-            if val != 0:
-                last_nonzero = val
-            else:
-                signs[i] = last_nonzero
-        # Backward fill remaining zeros if the array started with zeros
-        last_nonzero = 0
-        for i in range(len(signs) - 1, -1, -1):
-            if signs[i] != 0:
-                last_nonzero = signs[i]
-            else:
-                signs[i] = last_nonzero
+        for idx in range(window, values.size - window):
+            current = values[idx]
+            prev_window = values[idx - window : idx]
+            next_window = values[idx + 1 : idx + 1 + window]
 
-        nonzero = np.nonzero(signs)[0]
-        if nonzero.size == 0:
-            return []
+            prev_max = float(prev_window.max()) if prev_window.size else current
+            next_max = float(next_window.max()) if next_window.size else current
+            prev_min = float(prev_window.min()) if prev_window.size else current
+            next_min = float(next_window.min()) if next_window.size else current
 
-        initial_sign = signs[nonzero[0]]
-        initial_type = "min" if initial_sign > 0 else "max"
-        turning_points: List[Tuple[int, str]] = [(0, initial_type)]
-        last_turn_idx = 0
-        last_sign = initial_sign
-
-        for i in range(nonzero[0] + 1, len(signs)):
-            current_sign = signs[i]
-            if current_sign == 0 or current_sign == last_sign:
-                continue
-
-            search_start = last_turn_idx
-            search_end = min(i + 2, values.size)
-            if search_end <= search_start + 1:
-                search_end = min(search_start + 3, values.size)
-
-            segment = values[search_start:search_end]
-            if segment.size == 0:
-                continue
-
-            if last_sign > 0 and current_sign < 0:
-                local_rel = int(np.argmax(segment))
-                turn_type = "max"
-            elif last_sign < 0 and current_sign > 0:
-                local_rel = int(np.argmin(segment))
-                turn_type = "min"
-            else:
-                last_sign = current_sign
-                continue
-
-            turn_idx = search_start + local_rel
-            if turn_idx == last_turn_idx and search_end < values.size:
-                # Try to advance one sample if the local extremum collides with the previous turn
-                turn_idx = min(search_start + local_rel + 1, values.size - 1)
-
-            if turn_idx <= last_turn_idx and search_end < values.size:
-                turn_idx = min(search_end, values.size - 1)
-
-            if turn_idx <= last_turn_idx:
-                last_sign = current_sign
-                continue
-
-            turning_points.append((turn_idx, turn_type))
-            last_turn_idx = turn_idx
-            last_sign = current_sign
-
-        if turning_points and turning_points[-1][0] != values.size - 1:
-            # Append the final frame so trailing motion is captured when it returns to the same state.
-            final_type = turning_points[-1][1]
-            turning_points.append((values.size - 1, final_type))
+            if (
+                current >= prev_max
+                and current >= next_max
+                and current - min(prev_min, next_min) >= prominence
+            ):
+                if turning_points and turning_points[-1][0] == idx and turning_points[-1][1] == "max":
+                    continue
+                turning_points.append((idx, "max"))
+            elif (
+                current <= prev_min
+                and current <= next_min
+                and max(prev_max, next_max) - current >= prominence
+            ):
+                if turning_points and turning_points[-1][0] == idx and turning_points[-1][1] == "min":
+                    continue
+                turning_points.append((idx, "min"))
 
         return turning_points
 
