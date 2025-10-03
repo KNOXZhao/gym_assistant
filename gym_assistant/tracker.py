@@ -12,7 +12,7 @@ import torch
 
 from sam2.sam2_video_predictor import SAM2VideoPredictor
 
-from .detection import PlateCandidate, detect_plate_candidates, overlay_candidates
+from .detection import PlateCandidate
 
 
 @dataclass
@@ -66,15 +66,69 @@ class PlateTracker:
         return frame
 
     @staticmethod
-    def save_preview_image(frame: np.ndarray, candidates: Sequence[PlateCandidate], output_path: Path) -> None:
+    def save_coordinate_grid(
+        frame: np.ndarray,
+        output_path: Path,
+        grid_divisions: int = 10,
+        color: Tuple[int, int, int] = (0, 255, 0),
+    ) -> None:
+        """Save an image with a coordinate grid overlaid on the frame."""
+
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        preview = overlay_candidates(frame, candidates)
+        preview = frame.copy()
+        height, width = preview.shape[:2]
+        step_x = width / grid_divisions
+        step_y = height / grid_divisions
+
+        for i in range(grid_divisions + 1):
+            x = int(round(i * step_x))
+            y = int(round(i * step_y))
+
+            # Draw vertical grid line and annotate the x-coordinate.
+            cv2.line(preview, (x, 0), (x, height - 1), color, 1)
+            if 0 <= x < width:
+                label_pos = (min(x + 5, width - 80), 20)
+                cv2.putText(
+                    preview,
+                    str(x),
+                    label_pos,
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    1,
+                    cv2.LINE_AA,
+                )
+
+            # Draw horizontal grid line and annotate the y-coordinate.
+            cv2.line(preview, (0, y), (width - 1, y), color, 1)
+            if 0 <= y < height:
+                label_pos = (5, min(y + 15, height - 10))
+                cv2.putText(
+                    preview,
+                    str(y),
+                    label_pos,
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    1,
+                    cv2.LINE_AA,
+                )
+
         cv2.imwrite(str(output_path), preview)
 
-    def propose_candidates(self, video_path: str, max_candidates: int = 5) -> List[PlateCandidate]:
-        frame = self.load_first_frame(video_path)
-        candidates = detect_plate_candidates(frame, max_candidates=max_candidates)
-        return candidates
+    @staticmethod
+    def candidate_from_box(box: Tuple[int, int, int, int]) -> PlateCandidate:
+        """Create a plate candidate from a bounding box."""
+
+        x1, y1, x2, y2 = box
+        x1, x2 = sorted((x1, x2))
+        y1, y2 = sorted((y1, y2))
+        cx = (x1 + x2) / 2.0
+        cy = (y1 + y2) / 2.0
+        radius = max(x2 - x1, y2 - y1) / 2.0
+        if radius <= 0:
+            raise ValueError("Bounding box must have positive width and height")
+        return PlateCandidate(center=(cx, cy), radius=radius, score=radius)
 
     def run(
         self,
@@ -148,8 +202,9 @@ class PlateTracker:
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        suffix = Path(video_path).suffix.lower() or ".mp4"
         fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-        video_out_path = output_dir / "trajectory_overlay.mp4"
+        video_out_path = output_dir / f"trajectory_overlay{suffix}"
         writer = cv2.VideoWriter(str(video_out_path), fourcc, fps, (width, height))
 
         points_by_frame = {p.frame_idx: p for p in trajectory}
