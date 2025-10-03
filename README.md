@@ -5,7 +5,7 @@ A minimal example for tracking the trajectory of a barbell plate using [SAM 2.1 
 ## Features
 - Generate a coordinate grid preview so you can read off approximate plate locations in pixel space.
 - Initialize SAM 2.1 tracking from a user-provided point that seeds the segmentation mask.
-- Export the plate trajectory as a CSV table along with annotated overlays, mask previews, and per-rep trajectory plots.
+- Export the plate trajectory as a CSV table along with annotated overlays, mask previews, and per-rep trajectory plots that span full down-up or up-down cycles.
 
 ## Installation
 ```bash

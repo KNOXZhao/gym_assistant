@@ -462,8 +462,8 @@ class PlateTracker:
                 )
             ]
 
-        diffs = np.diff(smoothed)
-        if np.allclose(diffs, 0):
+        turning_points = self._find_turning_points(smoothed)
+        if len(turning_points) < 3:
             return [
                 RepSegment(
                     index=0,
@@ -472,84 +472,35 @@ class PlateTracker:
                     points=list(trajectory),
                 )
             ]
-
-        directions = np.sign(diffs)
-        nonzero = np.nonzero(directions)[0]
-        if nonzero.size == 0:
-            return [
-                RepSegment(
-                    index=0,
-                    start_frame=trajectory[0].frame_idx,
-                    end_frame=trajectory[-1].frame_idx,
-                    points=list(trajectory),
-                )
-            ]
-
-        first_dir = directions[nonzero[0]]
-        directions[: nonzero[0]] = first_dir
-        for i in range(1, len(directions)):
-            if directions[i] == 0:
-                directions[i] = directions[i - 1]
 
         rep_segments: List[RepSegment] = []
-        current_points: List[TrajectoryPoint] = [trajectory[0]]
-        current_min = current_max = smoothed[0]
-        flip_count = 0
-        last_dir = directions[0]
+        idx = 0
+        while idx <= len(turning_points) - 3:
+            start_idx, start_type = turning_points[idx]
+            _, mid_type = turning_points[idx + 1]
+            end_idx, end_type = turning_points[idx + 2]
 
-        for idx in range(1, len(trajectory)):
-            point = trajectory[idx]
-            current_points.append(point)
-            value = smoothed[min(idx, len(smoothed) - 1)]
-            current_min = float(min(current_min, value))
-            current_max = float(max(current_max, value))
+            start_idx = int(start_idx)
+            end_idx = int(end_idx)
 
-            if idx - 1 >= len(directions):
-                continue
-
-            current_dir = directions[idx - 1]
-            if current_dir != last_dir:
-                flip_count += 1
-                last_dir = current_dir
-
-            if flip_count >= 2:
-                amplitude = current_max - current_min
-                if len(current_points) >= min_points and amplitude >= delta:
+            if start_type == end_type and start_type != mid_type and end_idx > start_idx:
+                if end_idx >= len(trajectory):
+                    end_idx = len(trajectory) - 1
+                segment_points = list(trajectory[start_idx : end_idx + 1])
+                window_values = smoothed[start_idx : end_idx + 1]
+                amplitude = float(window_values.max() - window_values.min()) if window_values.size else 0.0
+                if len(segment_points) >= min_points and amplitude >= delta:
                     rep_segments.append(
                         RepSegment(
                             index=len(rep_segments),
-                            start_frame=current_points[0].frame_idx,
-                            end_frame=current_points[-1].frame_idx,
-                            points=list(current_points),
+                            start_frame=segment_points[0].frame_idx,
+                            end_frame=segment_points[-1].frame_idx,
+                            points=segment_points,
                         )
                     )
-                    current_points = [current_points[-1]]
-                    current_min = current_max = value
-                    flip_count = 0
-                else:
-                    flip_count = 1
-                    current_min = float(min(current_min, value))
-                    current_max = float(max(current_max, value))
-
-        if current_points:
-            amplitude = max(current_max - current_min, 0.0)
-            if rep_segments:
-                if len(current_points) > 1 and amplitude >= 0:
-                    last_segment = rep_segments[-1]
-                    # Avoid duplicating the shared starting point
-                    extra = current_points[1:]
-                    last_segment.points.extend(extra)
-                    if extra:
-                        last_segment.end_frame = extra[-1].frame_idx
-            elif len(current_points) >= min_points:
-                rep_segments.append(
-                    RepSegment(
-                        index=0,
-                        start_frame=current_points[0].frame_idx,
-                        end_frame=current_points[-1].frame_idx,
-                        points=list(current_points),
-                    )
-                )
+                    idx += 2
+                    continue
+            idx += 1
 
         if not rep_segments:
             return [
@@ -562,6 +513,87 @@ class PlateTracker:
             ]
 
         return rep_segments
+
+    def _find_turning_points(self, values: np.ndarray) -> List[Tuple[int, str]]:
+        if values.size == 0:
+            return []
+
+        diffs = np.diff(values)
+        if diffs.size == 0:
+            return []
+
+        signs = np.sign(diffs)
+        # Forward fill zeros with the last non-zero sign
+        last_nonzero = 0
+        for i, val in enumerate(signs):
+            if val != 0:
+                last_nonzero = val
+            else:
+                signs[i] = last_nonzero
+        # Backward fill remaining zeros if the array started with zeros
+        last_nonzero = 0
+        for i in range(len(signs) - 1, -1, -1):
+            if signs[i] != 0:
+                last_nonzero = signs[i]
+            else:
+                signs[i] = last_nonzero
+
+        nonzero = np.nonzero(signs)[0]
+        if nonzero.size == 0:
+            return []
+
+        initial_sign = signs[nonzero[0]]
+        initial_type = "min" if initial_sign > 0 else "max"
+        turning_points: List[Tuple[int, str]] = [(0, initial_type)]
+        last_turn_idx = 0
+        last_sign = initial_sign
+
+        for i in range(nonzero[0] + 1, len(signs)):
+            current_sign = signs[i]
+            if current_sign == 0 or current_sign == last_sign:
+                continue
+
+            search_start = last_turn_idx
+            search_end = min(i + 2, values.size)
+            if search_end <= search_start + 1:
+                search_end = min(search_start + 3, values.size)
+
+            segment = values[search_start:search_end]
+            if segment.size == 0:
+                continue
+
+            if last_sign > 0 and current_sign < 0:
+                local_rel = int(np.argmax(segment))
+                turn_type = "max"
+            elif last_sign < 0 and current_sign > 0:
+                local_rel = int(np.argmin(segment))
+                turn_type = "min"
+            else:
+                last_sign = current_sign
+                continue
+
+            turn_idx = search_start + local_rel
+            if turn_idx == last_turn_idx and search_end < values.size:
+                # Try to advance one sample if the local extremum collides with the previous turn
+                turn_idx = min(search_start + local_rel + 1, values.size - 1)
+
+            if turn_idx <= last_turn_idx and search_end < values.size:
+                turn_idx = min(search_end, values.size - 1)
+
+            if turn_idx <= last_turn_idx:
+                last_sign = current_sign
+                continue
+
+            turning_points.append((turn_idx, turn_type))
+            last_turn_idx = turn_idx
+            last_sign = current_sign
+
+        if turning_points and turning_points[-1][0] != values.size - 1:
+            # Append the final frame so trailing motion is captured when it returns to the same state.
+            final_type = turning_points[-1][1]
+            turning_points.append((values.size - 1, final_type))
+
+        return turning_points
 
     @staticmethod
     def _moving_average(values: np.ndarray, window: int = 5) -> np.ndarray:
