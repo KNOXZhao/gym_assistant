@@ -1,0 +1,6 @@
+opencv-python
+numpy
+torch
+matplotlib
+huggingface_hub
+sam2
