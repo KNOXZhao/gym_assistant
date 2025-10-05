@@ -482,32 +482,9 @@ class PlateTracker:
                 initial_sign = 1 if diff > 0 else -1
                 break
 
-        first_idx, first_type = turning_points[0]
-        if first_idx > 0:
-            if initial_sign < 0:
-                start_type = "max"
-            elif initial_sign > 0:
-                start_type = "min"
-            else:
-                start_type = "max" if first_type == "min" else "min"
-            turning_points.insert(0, (0, start_type))
+        turning_points = self._augment_turning_points(turning_points, smoothed, initial_sign)
 
-        last_idx, last_type = turning_points[-1]
-        if last_idx < len(smoothed) - 1:
-            final_sign = 0
-            for diff in reversed(diffs):
-                if abs(diff) >= 1e-3:
-                    final_sign = 1 if diff > 0 else -1
-                    break
-            if final_sign > 0:
-                end_type = "max"
-            elif final_sign < 0:
-                end_type = "min"
-            else:
-                end_type = "max" if last_type == "min" else "min"
-            turning_points.append((len(smoothed) - 1, end_type))
-
-        if len(turning_points) < 3:
+        if len(turning_points) < 2:
             return [
                 RepSegment(
                     index=0,
@@ -519,28 +496,32 @@ class PlateTracker:
 
         rep_segments: List[RepSegment] = []
         idx = 0
-        while idx <= len(turning_points) - 3:
-            start_idx, start_type = turning_points[idx]
+        while idx < len(turning_points) - 1:
+            start_sample, start_type = turning_points[idx]
+            opposite_found = False
+            end_idx = idx + 1
 
-            mid_idx = idx + 1
-            while mid_idx < len(turning_points) and turning_points[mid_idx][1] == start_type:
-                mid_idx += 1
-            if mid_idx >= len(turning_points):
-                break
-
-            end_idx = mid_idx + 1
-            while end_idx < len(turning_points) and turning_points[end_idx][1] != start_type:
+            while end_idx < len(turning_points):
+                sample_idx, sample_type = turning_points[end_idx]
+                if sample_type != start_type:
+                    opposite_found = True
+                elif opposite_found:
+                    break
                 end_idx += 1
+
             if end_idx >= len(turning_points):
                 break
 
-            start_sample = int(turning_points[idx][0])
-            end_sample = int(turning_points[end_idx][0])
+            end_sample, _ = turning_points[end_idx]
             if end_sample <= start_sample:
                 idx += 1
                 continue
 
             segment_points = list(trajectory[start_sample : end_sample + 1])
+            if not segment_points:
+                idx += 1
+                continue
+
             window_values = smoothed[start_sample : end_sample + 1]
             amplitude = float(window_values.max() - window_values.min()) if window_values.size else 0.0
 
@@ -570,41 +551,90 @@ class PlateTracker:
 
         return rep_segments
 
+    def _augment_turning_points(
+        self,
+        turning_points: List[Tuple[int, str]],
+        smoothed: np.ndarray,
+        initial_sign: int,
+    ) -> List[Tuple[int, str]]:
+        if not turning_points:
+            return []
+
+        augmented = list(turning_points)
+        first_idx, first_type = augmented[0]
+        if first_idx > 0:
+            if initial_sign > 0:
+                start_type = "min"
+            elif initial_sign < 0:
+                start_type = "max"
+            else:
+                start_type = "min" if first_type == "max" else "max"
+            augmented.insert(0, (0, start_type))
+
+        last_idx, last_type = augmented[-1]
+        if last_idx < len(smoothed) - 1:
+            final_sign = 0
+            for diff in reversed(np.diff(smoothed)):
+                if abs(diff) >= 1e-3:
+                    final_sign = 1 if diff > 0 else -1
+                    break
+            if final_sign < 0:
+                end_type = "min"
+            elif final_sign > 0:
+                end_type = "max"
+            else:
+                end_type = "max" if last_type == "max" else "min"
+            augmented.append((len(smoothed) - 1, end_type))
+
+        cleaned: List[Tuple[int, str]] = []
+        for idx, kind in augmented:
+            if cleaned and cleaned[-1][1] == kind:
+                prev_idx, _ = cleaned[-1]
+                if kind == "max":
+                    better = idx if smoothed[idx] >= smoothed[prev_idx] else prev_idx
+                else:
+                    better = idx if smoothed[idx] <= smoothed[prev_idx] else prev_idx
+                cleaned[-1] = (better, kind)
+            else:
+                cleaned.append((idx, kind))
+
+        return cleaned
+
     def _find_turning_points(self, values: np.ndarray, prominence: float) -> List[Tuple[int, str]]:
         if values.size < 3:
             return []
 
-        window = min(5, max(1, values.size // 20))
         turning_points: List[Tuple[int, str]] = []
+        for idx in range(1, values.size - 1):
+            prev_val = float(values[idx - 1])
+            curr_val = float(values[idx])
+            next_val = float(values[idx + 1])
 
-        for idx in range(window, values.size - window):
-            current = values[idx]
-            prev_window = values[idx - window : idx]
-            next_window = values[idx + 1 : idx + 1 + window]
+            if curr_val >= prev_val and curr_val >= next_val:
+                local_prom = curr_val - min(prev_val, next_val)
+                if local_prom >= prominence:
+                    turning_points.append((idx, "max"))
+            if curr_val <= prev_val and curr_val <= next_val:
+                local_prom = max(prev_val, next_val) - curr_val
+                if local_prom >= prominence:
+                    turning_points.append((idx, "min"))
 
-            prev_max = float(prev_window.max()) if prev_window.size else current
-            next_max = float(next_window.max()) if next_window.size else current
-            prev_min = float(prev_window.min()) if prev_window.size else current
-            next_min = float(next_window.min()) if next_window.size else current
+        filtered: List[Tuple[int, str]] = []
+        for idx, kind in turning_points:
+            if not filtered:
+                filtered.append((idx, kind))
+                continue
+            prev_idx, prev_kind = filtered[-1]
+            if prev_kind == kind:
+                if kind == "max":
+                    better_idx = idx if values[idx] >= values[prev_idx] else prev_idx
+                else:
+                    better_idx = idx if values[idx] <= values[prev_idx] else prev_idx
+                filtered[-1] = (better_idx, kind)
+            else:
+                filtered.append((idx, kind))
 
-            if (
-                current >= prev_max
-                and current >= next_max
-                and current - min(prev_min, next_min) >= prominence
-            ):
-                if turning_points and turning_points[-1][0] == idx and turning_points[-1][1] == "max":
-                    continue
-                turning_points.append((idx, "max"))
-            elif (
-                current <= prev_min
-                and current <= next_min
-                and max(prev_max, next_max) - current >= prominence
-            ):
-                if turning_points and turning_points[-1][0] == idx and turning_points[-1][1] == "min":
-                    continue
-                turning_points.append((idx, "min"))
-
-        return turning_points
+        return filtered
 
     @staticmethod
     def _moving_average(values: np.ndarray, window: int = 5) -> np.ndarray:
