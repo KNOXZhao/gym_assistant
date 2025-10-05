@@ -436,6 +436,15 @@ class PlateTracker:
         min_points: int = 10,
         min_delta: float = 5.0,
     ) -> List[RepSegment]:
+        """
+        Segment trajectory into repetitions using a robust peak-detection method.
+        
+        New approach:
+        1. Heavy smoothing to remove jitter/noise
+        2. Calculate amplitude threshold as percentage of total range (much more robust)
+        3. Use scipy-like peak finding with distance constraint to avoid multiple peaks
+        4. Define rep as complete cycle from one rest position through movement and back
+        """
         if not trajectory:
             return []
 
@@ -448,11 +457,20 @@ class PlateTracker:
         y_vals = data[:, 3]
         x_range = float(x_vals.max() - x_vals.min())
         y_range = float(y_vals.max() - y_vals.min())
+        
+        # Use dimension with most movement
         primary_vals = y_vals if y_range >= x_range else x_vals
-
-        smoothed = self._moving_average(primary_vals, window=5)
-        delta = max(min_delta, 0.05 * float(smoothed.max() - smoothed.min()))
-        if delta <= 0:
+        total_range = float(primary_vals.max() - primary_vals.min())
+        
+        # Heavy smoothing to eliminate noise - use larger window
+        smoothed = self._moving_average(primary_vals, window=15)
+        
+        # Set amplitude threshold as 15% of total range - this filters out noise
+        # For a deadlift with ~300px range, this means we need 45px amplitude minimum
+        amplitude_threshold = max(min_delta, 0.15 * total_range)
+        
+        if total_range < min_delta:
+            # No significant movement - treat as one segment
             return [
                 RepSegment(
                     index=0,
@@ -461,11 +479,16 @@ class PlateTracker:
                     points=list(trajectory),
                 )
             ]
-
-        prominence = max(0.25 * min_delta, 0.01 * float(smoothed.max() - smoothed.min()), 1.0)
-
-        turning_points = self._find_turning_points(smoothed, prominence)
-        if not turning_points:
+        
+        # Find all local maxima and minima with significant prominence
+        # Prominence should be substantial to avoid noise
+        prominence_threshold = max(amplitude_threshold * 0.5, 10.0)
+        
+        maxima = self._find_peaks(smoothed, prominence_threshold, is_max=True)
+        minima = self._find_peaks(smoothed, prominence_threshold, is_max=False)
+        
+        if not maxima or not minima:
+            # No clear peaks found
             return [
                 RepSegment(
                     index=0,
@@ -474,72 +497,54 @@ class PlateTracker:
                     points=list(trajectory),
                 )
             ]
-
-        diffs = np.diff(smoothed)
-        initial_sign = 0
-        for diff in diffs:
-            if abs(diff) >= 1e-3:
-                initial_sign = 1 if diff > 0 else -1
-                break
-
-        turning_points = self._augment_turning_points(turning_points, smoothed, initial_sign)
-
-        if len(turning_points) < 2:
-            return [
-                RepSegment(
-                    index=0,
-                    start_frame=trajectory[0].frame_idx,
-                    end_frame=trajectory[-1].frame_idx,
-                    points=list(trajectory),
-                )
-            ]
-
+        
+        # Merge and sort turning points
+        turning_points = sorted(
+            [(idx, 'max') for idx in maxima] + [(idx, 'min') for idx in minima],
+            key=lambda x: x[0]
+        )
+        
+        # Build rep segments: each rep goes from one extreme through opposite extreme and back
+        # E.g., for deadlift (vertical movement):
+        # - Rest at top (max Y ~1091) -> lift down (min Y ~793) -> back to top (max Y ~1091)
+        # This is one complete repetition
+        
         rep_segments: List[RepSegment] = []
-        idx = 0
-        while idx < len(turning_points) - 1:
-            start_sample, start_type = turning_points[idx]
-            opposite_found = False
-            end_idx = idx + 1
-
-            while end_idx < len(turning_points):
-                sample_idx, sample_type = turning_points[end_idx]
-                if sample_type != start_type:
-                    opposite_found = True
-                elif opposite_found:
-                    break
-                end_idx += 1
-
-            if end_idx >= len(turning_points):
-                break
-
-            end_sample, _ = turning_points[end_idx]
-            if end_sample <= start_sample:
-                idx += 1
-                continue
-
-            segment_points = list(trajectory[start_sample : end_sample + 1])
-            if not segment_points:
-                idx += 1
-                continue
-
-            window_values = smoothed[start_sample : end_sample + 1]
-            amplitude = float(window_values.max() - window_values.min()) if window_values.size else 0.0
-
-            if len(segment_points) >= min_points and amplitude >= delta:
-                rep_segments.append(
-                    RepSegment(
-                        index=len(rep_segments),
-                        start_frame=segment_points[0].frame_idx,
-                        end_frame=segment_points[-1].frame_idx,
-                        points=segment_points,
-                    )
-                )
-                idx = end_idx
-                continue
-
-            idx += 1
-
+        i = 0
+        
+        while i < len(turning_points) - 2:
+            start_idx, start_type = turning_points[i]
+            middle_idx, middle_type = turning_points[i + 1]
+            end_idx, end_type = turning_points[i + 2]
+            
+            # Valid rep: start and end should be same type, middle should be opposite
+            if start_type == end_type and middle_type != start_type:
+                # Calculate amplitude
+                segment_vals = smoothed[start_idx:end_idx + 1]
+                amplitude = float(segment_vals.max() - segment_vals.min())
+                
+                # Only accept if amplitude is significant
+                if amplitude >= amplitude_threshold:
+                    segment_points = list(trajectory[start_idx:end_idx + 1])
+                    
+                    if len(segment_points) >= min_points:
+                        rep_segments.append(
+                            RepSegment(
+                                index=len(rep_segments),
+                                start_frame=segment_points[0].frame_idx,
+                                end_frame=segment_points[-1].frame_idx,
+                                points=segment_points,
+                            )
+                        )
+                        # Move past this rep
+                        i += 2
+                        continue
+            
+            # Move to next potential rep
+            i += 1
+        
         if not rep_segments:
+            # Fallback: treat entire trajectory as one segment
             return [
                 RepSegment(
                     index=0,
@@ -548,93 +553,63 @@ class PlateTracker:
                     points=list(trajectory),
                 )
             ]
-
+        
         return rep_segments
 
-    def _augment_turning_points(
-        self,
-        turning_points: List[Tuple[int, str]],
-        smoothed: np.ndarray,
-        initial_sign: int,
-    ) -> List[Tuple[int, str]]:
-        if not turning_points:
-            return []
-
-        augmented = list(turning_points)
-        first_idx, first_type = augmented[0]
-        if first_idx > 0:
-            if initial_sign > 0:
-                start_type = "min"
-            elif initial_sign < 0:
-                start_type = "max"
-            else:
-                start_type = "min" if first_type == "max" else "max"
-            augmented.insert(0, (0, start_type))
-
-        last_idx, last_type = augmented[-1]
-        if last_idx < len(smoothed) - 1:
-            final_sign = 0
-            for diff in reversed(np.diff(smoothed)):
-                if abs(diff) >= 1e-3:
-                    final_sign = 1 if diff > 0 else -1
-                    break
-            if final_sign < 0:
-                end_type = "min"
-            elif final_sign > 0:
-                end_type = "max"
-            else:
-                end_type = "max" if last_type == "max" else "min"
-            augmented.append((len(smoothed) - 1, end_type))
-
-        cleaned: List[Tuple[int, str]] = []
-        for idx, kind in augmented:
-            if cleaned and cleaned[-1][1] == kind:
-                prev_idx, _ = cleaned[-1]
-                if kind == "max":
-                    better = idx if smoothed[idx] >= smoothed[prev_idx] else prev_idx
-                else:
-                    better = idx if smoothed[idx] <= smoothed[prev_idx] else prev_idx
-                cleaned[-1] = (better, kind)
-            else:
-                cleaned.append((idx, kind))
-
-        return cleaned
-
-    def _find_turning_points(self, values: np.ndarray, prominence: float) -> List[Tuple[int, str]]:
+    def _find_peaks(
+        self, 
+        values: np.ndarray, 
+        prominence: float, 
+        is_max: bool = True,
+        min_distance: int = 30
+    ) -> List[int]:
+        """
+        Find peaks (maxima or minima) with given prominence and minimum distance.
+        
+        Args:
+            values: 1D array of values
+            prominence: Minimum prominence for a peak
+            is_max: If True, find maxima; if False, find minima
+            min_distance: Minimum distance between peaks (prevents multiple detections)
+        
+        Returns:
+            List of peak indices
+        """
         if values.size < 3:
             return []
-
-        turning_points: List[Tuple[int, str]] = []
-        for idx in range(1, values.size - 1):
-            prev_val = float(values[idx - 1])
-            curr_val = float(values[idx])
-            next_val = float(values[idx + 1])
-
-            if curr_val >= prev_val and curr_val >= next_val:
-                local_prom = curr_val - min(prev_val, next_val)
-                if local_prom >= prominence:
-                    turning_points.append((idx, "max"))
-            if curr_val <= prev_val and curr_val <= next_val:
-                local_prom = max(prev_val, next_val) - curr_val
-                if local_prom >= prominence:
-                    turning_points.append((idx, "min"))
-
-        filtered: List[Tuple[int, str]] = []
-        for idx, kind in turning_points:
-            if not filtered:
-                filtered.append((idx, kind))
-                continue
-            prev_idx, prev_kind = filtered[-1]
-            if prev_kind == kind:
-                if kind == "max":
-                    better_idx = idx if values[idx] >= values[prev_idx] else prev_idx
-                else:
-                    better_idx = idx if values[idx] <= values[prev_idx] else prev_idx
-                filtered[-1] = (better_idx, kind)
+        
+        # For minima, invert the signal
+        signal = values if is_max else -values
+        
+        peaks: List[int] = []
+        
+        # Simple peak detection: point higher than neighbors
+        for idx in range(1, len(signal) - 1):
+            if signal[idx] > signal[idx - 1] and signal[idx] > signal[idx + 1]:
+                # Check prominence
+                # Find the lowest point in the local region
+                left_min = signal[max(0, idx - 50):idx].min() if idx > 0 else signal[idx]
+                right_min = signal[idx + 1:min(len(signal), idx + 51)].min() if idx < len(signal) - 1 else signal[idx]
+                local_min = min(left_min, right_min)
+                prom = signal[idx] - local_min
+                
+                if prom >= prominence:
+                    peaks.append(idx)
+        
+        # Filter peaks by minimum distance
+        if len(peaks) <= 1:
+            return peaks
+        
+        filtered_peaks = [peaks[0]]
+        for peak_idx in peaks[1:]:
+            if peak_idx - filtered_peaks[-1] >= min_distance:
+                filtered_peaks.append(peak_idx)
             else:
-                filtered.append((idx, kind))
-
-        return filtered
+                # Keep the higher peak
+                if signal[peak_idx] > signal[filtered_peaks[-1]]:
+                    filtered_peaks[-1] = peak_idx
+        
+        return filtered_peaks
 
     @staticmethod
     def _moving_average(values: np.ndarray, window: int = 5) -> np.ndarray:
