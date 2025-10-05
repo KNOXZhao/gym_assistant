@@ -611,6 +611,7 @@ class PlateTracker:
             ax_path.set_xlabel("Side-view X (px)")
             ax_path.set_ylabel("Y (px)")
             ax_path.invert_yaxis()
+            ax_path.set_aspect("equal", adjustable="box")
             ax_path.legend(loc="best")
 
             ax_height.plot(times, ys, color="tab:blue", linewidth=2)
