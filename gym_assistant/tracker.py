@@ -151,17 +151,105 @@ class PlateTracker:
         )
         return predictor, state
 
-    def _mask_to_center(self, mask_np: np.ndarray) -> tuple[float, float] | None:
-        if mask_np.dtype != np.bool_:
-            mask_np = mask_np > 0.5
+    def _extract_plate_region(
+        self,
+        mask_np: np.ndarray,
+        reference_center: tuple[float, float] | None = None,
+    ) -> tuple[np.ndarray, tuple[float, float]] | None:
+        """Select the plate region from a SAM mask.
+
+        The raw SAM mask occasionally includes parts of the barbell. We refine the
+        mask by (a) trimming pixels that extend far from the expected plate center
+        and (b) selecting the most plate-like connected component. This keeps the
+        circular plate while discarding elongated regions along the bar.
+        """
+
         if mask_np.ndim != 2:
             return None
-        ys, xs = np.nonzero(mask_np)
-        if len(xs) == 0:
+
+        mask_bool = mask_np.astype(np.float32) > 0.5
+        if not np.any(mask_bool):
             return None
-        cx = float(xs.mean())
-        cy = float(ys.mean())
-        return cx, cy
+
+        if reference_center is not None:
+            ys, xs = np.nonzero(mask_bool)
+            distances = np.hypot(xs - reference_center[0], ys - reference_center[1])
+            if len(distances) == 0:
+                return None
+            median_dist = float(np.median(distances))
+            # Estimate radius assuming a roughly circular plate.
+            radius_est = max(median_dist * 1.4142, 1.0)
+            radius_limit = radius_est * 1.2
+            keep = distances <= radius_limit
+            trimmed_mask = np.zeros_like(mask_bool)
+            trimmed_mask[ys[keep], xs[keep]] = True
+            # Only accept the trimmed mask if it preserves a substantial area.
+            if np.count_nonzero(trimmed_mask) >= max(50, int(np.count_nonzero(mask_bool) * 0.25)):
+                mask_bool = trimmed_mask
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        closed = cv2.morphologyEx(mask_bool.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+        if np.count_nonzero(closed) > 0:
+            mask_uint8 = closed
+        else:
+            mask_uint8 = mask_bool.astype(np.uint8)
+
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            mask_uint8, connectivity=8
+        )
+
+        if num_labels <= 1:
+            final_mask = mask_uint8.astype(bool)
+        else:
+            best_label = None
+            best_score = -np.inf
+            for label in range(1, num_labels):
+                area = stats[label, cv2.CC_STAT_AREA]
+                if area < 30:
+                    continue
+                width = stats[label, cv2.CC_STAT_WIDTH]
+                height = stats[label, cv2.CC_STAT_HEIGHT]
+                if width <= 0 or height <= 0:
+                    continue
+                aspect_ratio = max(width, height) / max(1, min(width, height))
+                extent = area / float(width * height)
+                circularity_penalty = abs(np.log(aspect_ratio + 1e-6))
+                distance_penalty = 0.0
+                if reference_center is not None:
+                    centroid_x, centroid_y = centroids[label]
+                    distance = float(
+                        np.hypot(centroid_x - reference_center[0], centroid_y - reference_center[1])
+                    )
+                    distance_penalty = distance / max(max(width, height), 1.0)
+                score = area * (extent ** 0.5)
+                score /= 1.0 + 0.5 * circularity_penalty + 0.3 * distance_penalty
+                if score > best_score:
+                    best_score = score
+                    best_label = label
+
+            if best_label is None:
+                final_mask = mask_uint8.astype(bool)
+            else:
+                final_mask = labels == best_label
+
+        ys_final, xs_final = np.nonzero(final_mask)
+        if len(xs_final) == 0:
+            return None
+
+        cx = float(xs_final.mean())
+        cy = float(ys_final.mean())
+        return final_mask.astype(bool), (cx, cy)
+
+    def _mask_to_center(
+        self,
+        mask_np: np.ndarray,
+        reference_center: tuple[float, float] | None = None,
+    ) -> tuple[float, float] | None:
+        result = self._extract_plate_region(mask_np, reference_center=reference_center)
+        if result is None:
+            return None
+        _, center = result
+        return center
 
     def save_mask_preview(
         self,
@@ -198,15 +286,20 @@ class PlateTracker:
             return None
 
         mask_np = np.squeeze(mask_np)
-        center = self._mask_to_center(mask_np)
+        result = self._extract_plate_region(
+            mask_np, reference_center=candidate.center
+        )
+        if result is None:
+            return None
+        mask_bool, center = result
         if center is None:
             return None
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         frame = self.load_first_frame(video_path)
-        mask_bool = (mask_np > 0.5).astype(np.uint8)
+        mask_uint8 = mask_bool.astype(np.uint8)
         mask_color = np.zeros_like(frame)
-        mask_color[:, :, 2] = mask_bool * 255
+        mask_color[:, :, 2] = mask_uint8 * 255
         preview = cv2.addWeighted(frame, 1.0, mask_color, 0.4, 0)
         cv2.circle(preview, (int(round(center[0])), int(round(center[1]))), 8, (0, 255, 255), -1)
         cv2.imwrite(str(output_path), preview)
@@ -241,6 +334,8 @@ class PlateTracker:
         output_dir_path.mkdir(parents=True, exist_ok=True)
         csv_path = output_dir_path / "trajectory.csv"
 
+        last_center: tuple[float, float] | None = candidate.center
+
         with open(csv_path, "w", newline="", encoding="utf-8") as csv_file:
             writer = csv.writer(csv_file)
             writer.writerow(["frame_idx", "time_s", "x", "y"])
@@ -253,9 +348,15 @@ class PlateTracker:
                 else:
                     mask_np = np.asarray(frame_mask)
                 mask_np = np.squeeze(mask_np)
-                center = self._mask_to_center(mask_np)
+                result = self._extract_plate_region(
+                    mask_np, reference_center=last_center
+                )
+                if result is None:
+                    continue
+                _, center = result
                 if center is None:
                     continue
+                last_center = center
                 cx, cy = center
                 time_s = frame_idx_out / fps
                 point = TrajectoryPoint(frame_idx=frame_idx_out, time_s=time_s, x=cx, y=cy)
