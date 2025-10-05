@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
@@ -23,6 +24,7 @@ class TrajectoryPoint:
     time_s: float
     x: float
     y: float
+    x_side: Optional[float] = None
 
 
 @dataclass
@@ -240,6 +242,42 @@ class PlateTracker:
         cy = float(ys_final.mean())
         return final_mask.astype(bool), (cx, cy)
 
+    def _estimate_camera_angle(self, mask_bool: np.ndarray) -> Optional[float]:
+        """Estimate camera yaw angle from the apparent ellipse of the plate mask.
+
+        The camera is assumed to rotate around the vertical axis relative to a
+        true side-on view. A circular plate therefore appears as an ellipse.
+        The ratio between the minor and major axes of this ellipse is
+        cos(theta), where theta is the yaw angle. Returns the angle in radians
+        when it can be estimated reliably.
+        """
+
+        if mask_bool.dtype != bool:
+            mask_bool = mask_bool.astype(bool)
+
+        ys, xs = np.nonzero(mask_bool)
+        if xs.size < 5:
+            return None
+
+        points = np.column_stack((xs, ys)).astype(np.float32)
+        try:
+            ellipse = cv2.fitEllipse(points)
+        except cv2.error:
+            return None
+
+        (_, _), axes, _ = ellipse
+        if axes[0] <= 0 or axes[1] <= 0:
+            return None
+
+        major = max(axes)
+        minor = min(axes)
+        if major <= 0:
+            return None
+
+        ratio = float(minor / major)
+        ratio = float(np.clip(ratio, 0.01, 1.0))
+        return math.acos(ratio)
+
     def _mask_to_center(
         self,
         mask_np: np.ndarray,
@@ -335,10 +373,13 @@ class PlateTracker:
         csv_path = output_dir_path / "trajectory.csv"
 
         last_center: tuple[float, float] | None = candidate.center
+        first_center: tuple[float, float] | None = None
+        angle_samples: List[float] = []
+        cos_angle = 1.0
 
         with open(csv_path, "w", newline="", encoding="utf-8") as csv_file:
             writer = csv.writer(csv_file)
-            writer.writerow(["frame_idx", "time_s", "x", "y"])
+            writer.writerow(["frame_idx", "time_s", "x", "y", "x_side"])
             for frame_idx_out, obj_ids, masks in predictor.propagate_in_video(state):
                 if obj_idx is None:
                     obj_idx = obj_ids.index(obj_id)
@@ -348,23 +389,62 @@ class PlateTracker:
                 else:
                     mask_np = np.asarray(frame_mask)
                 mask_np = np.squeeze(mask_np)
-                result = self._extract_plate_region(
-                    mask_np, reference_center=last_center
-                )
+                result = self._extract_plate_region(mask_np, reference_center=last_center)
                 if result is None:
                     continue
-                _, center = result
+                mask_bool, center = result
                 if center is None:
                     continue
                 last_center = center
+                if first_center is None:
+                    first_center = center
+
+                angle_est = self._estimate_camera_angle(mask_bool)
+                if angle_est is not None:
+                    angle_samples.append(angle_est)
+                    median_angle = float(np.median(angle_samples))
+                    cos_angle = math.cos(median_angle)
+                    cos_angle = float(np.clip(cos_angle, 0.1, 1.0))
+
+                if first_center is not None:
+                    delta_x = center[0] - first_center[0]
+                    side_x = first_center[0] + delta_x / cos_angle
+                else:
+                    side_x = center[0]
                 cx, cy = center
                 time_s = frame_idx_out / fps
-                point = TrajectoryPoint(frame_idx=frame_idx_out, time_s=time_s, x=cx, y=cy)
+                point = TrajectoryPoint(
+                    frame_idx=frame_idx_out,
+                    time_s=time_s,
+                    x=cx,
+                    y=cy,
+                    x_side=side_x,
+                )
                 trajectory.append(point)
-                writer.writerow([frame_idx_out, f"{time_s:.6f}", f"{cx:.2f}", f"{cy:.2f}"])
+                writer.writerow(
+                    [
+                        frame_idx_out,
+                        f"{time_s:.6f}",
+                        f"{cx:.2f}",
+                        f"{cy:.2f}",
+                        f"{side_x:.2f}",
+                    ]
+                )
 
         rep_segments = self._segment_repetitions(trajectory)
-        self._export_visualizations(video_path, trajectory, rep_segments, output_dir_path)
+        side_angle_deg: Optional[float] = None
+        if angle_samples:
+            side_angle_deg = math.degrees(float(np.median(angle_samples)))
+            angle_path = output_dir_path / "camera_angle_degrees.txt"
+            angle_path.write_text(f"{side_angle_deg:.2f}\n", encoding="utf-8")
+
+        self._export_visualizations(
+            video_path,
+            trajectory,
+            rep_segments,
+            output_dir_path,
+            side_angle_deg=side_angle_deg,
+        )
         return trajectory, rep_segments
 
     def _export_visualizations(
@@ -373,6 +453,8 @@ class PlateTracker:
         trajectory: Sequence[TrajectoryPoint],
         rep_segments: Sequence[RepSegment],
         output_dir: Path,
+        *,
+        side_angle_deg: Optional[float] = None,
     ) -> None:
         if not trajectory:
             return
@@ -491,9 +573,15 @@ class PlateTracker:
         cap.release()
         writer.release()
 
-        self._export_rep_plots(rep_segments, output_dir)
+        self._export_rep_plots(rep_segments, output_dir, side_angle_deg=side_angle_deg)
 
-    def _export_rep_plots(self, rep_segments: Sequence[RepSegment], output_dir: Path) -> None:
+    def _export_rep_plots(
+        self,
+        rep_segments: Sequence[RepSegment],
+        output_dir: Path,
+        *,
+        side_angle_deg: Optional[float] = None,
+    ) -> None:
         try:
             import matplotlib.pyplot as plt
         except Exception:
@@ -505,7 +593,7 @@ class PlateTracker:
         for segment in rep_segments:
             if not segment.points:
                 continue
-            xs = [p.x for p in segment.points]
+            xs = [p.x_side if p.x_side is not None else p.x for p in segment.points]
             ys = [p.y for p in segment.points]
             times = [p.time_s for p in segment.points]
             plot_path = output_dir / f"trajectory_plot_rep_{segment.index + 1}.png"
@@ -514,8 +602,13 @@ class PlateTracker:
             ax_path.plot(xs, ys, color="tab:red", linewidth=2)
             ax_path.scatter(xs[0], ys[0], color="tab:green", label="start")
             ax_path.scatter(xs[-1], ys[-1], color="tab:red", label="end")
-            ax_path.set_title(f"Rep {segment.index + 1} path")
-            ax_path.set_xlabel("X (px)")
+            if side_angle_deg is not None:
+                ax_path.set_title(
+                    f"Rep {segment.index + 1} side path (angle {side_angle_deg:.1f}°)"
+                )
+            else:
+                ax_path.set_title(f"Rep {segment.index + 1} path")
+            ax_path.set_xlabel("Side-view X (px)")
             ax_path.set_ylabel("Y (px)")
             ax_path.invert_yaxis()
             ax_path.legend(loc="best")
@@ -724,5 +817,13 @@ class PlateTracker:
         return smoothed.astype(np.float32)
 
 def trajectory_to_array(trajectory: Iterable[TrajectoryPoint]) -> np.ndarray:
-    data = [(p.frame_idx, p.time_s, p.x, p.y) for p in trajectory]
+    data = [
+        (
+            p.frame_idx,
+            p.time_s,
+            p.x_side if p.x_side is not None else p.x,
+            p.y,
+        )
+        for p in trajectory
+    ]
     return np.array(data, dtype=np.float32)
