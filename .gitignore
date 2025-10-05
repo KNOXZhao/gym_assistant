@@ -1,3 +1,20 @@
-# Output and video directories
+# Ignore output folders
 outputs/
 videos/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
