@@ -1,6 +1,7 @@
 """Video tracking pipeline using SAM 2.1 for weight plates."""
 from __future__ import annotations
 
+from bisect import bisect_right
 import csv
 import math
 from dataclasses import dataclass
@@ -63,6 +64,8 @@ class PlateTracker:
             raise FileNotFoundError(f"Unable to open video: {video_path}")
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        if fps <= 0:
+            fps = 30.0
         cap.release()
         return frame_count, fps
 
@@ -470,7 +473,8 @@ class PlateTracker:
         video_out_path = output_dir / f"trajectory_overlay{suffix}"
         writer = cv2.VideoWriter(str(video_out_path), fourcc, fps, (width, height))
 
-        rep_points: List[List[Tuple[int, int]]] = []
+        rep_points: List[np.ndarray] = []
+        rep_frames: List[List[int]] = []
         rep_frame_bounds: List[Tuple[int, int]] = []
 
         if not rep_segments:
@@ -483,10 +487,19 @@ class PlateTracker:
                 )
             ]
 
+        smoothing_window = max(3, int(round(fps * 0.1)))
+
         for segment in rep_segments:
-            pts = [(int(round(p.x)), int(round(p.y))) for p in segment.points]
-            rep_points.append(pts)
             rep_frame_bounds.append((segment.start_frame, segment.end_frame))
+            if not segment.points:
+                rep_points.append(np.empty((0, 2), dtype=np.float32))
+                rep_frames.append([])
+                continue
+
+            raw_pts = [(float(p.x), float(p.y)) for p in segment.points]
+            smoothed = self._smooth_polyline(raw_pts, window=smoothing_window)
+            rep_points.append(smoothed)
+            rep_frames.append([p.frame_idx for p in segment.points])
 
         frame_idx = 0
         fade_frames = max(15, int(round(fps * 0.5)))
@@ -505,23 +518,24 @@ class PlateTracker:
 
             for idx, segment in enumerate(rep_segments):
                 pts = rep_points[idx]
-                if not pts:
+                frames = rep_frames[idx]
+                if pts.size == 0 or not frames:
                     continue
                 start_f, end_f = rep_frame_bounds[idx]
 
                 if frame_idx < start_f:
                     continue
 
+                valid_len = bisect_right(frames, frame_idx)
+
                 if current_rep == idx:
-                    active_pts = [
-                        (int(round(p.x)), int(round(p.y)))
-                        for p in segment.points
-                        if p.frame_idx <= frame_idx
-                    ]
-                    if len(active_pts) > 1:
+                    if valid_len > 1:
+                        active_pts = np.ascontiguousarray(
+                            np.round(pts[:valid_len]).astype(np.int32)
+                        )
                         cv2.polylines(
                             overlay,
-                            [np.array(active_pts, dtype=np.int32)],
+                            [active_pts],
                             False,
                             (0, 0, 255),
                             2,
@@ -529,15 +543,13 @@ class PlateTracker:
                     continue
 
                 if frame_idx <= end_f:
-                    partial_pts = [
-                        (int(round(p.x)), int(round(p.y)))
-                        for p in segment.points
-                        if p.frame_idx <= frame_idx
-                    ]
-                    if len(partial_pts) > 1:
+                    if valid_len > 1:
+                        partial_pts = np.ascontiguousarray(
+                            np.round(pts[:valid_len]).astype(np.int32)
+                        )
                         cv2.polylines(
                             overlay,
-                            [np.array(partial_pts, dtype=np.int32)],
+                            [partial_pts],
                             False,
                             (0, 0, 200),
                             2,
@@ -546,12 +558,13 @@ class PlateTracker:
 
                 frames_since_end = frame_idx - end_f
                 alpha = max(0.0, 1.0 - frames_since_end / fade_frames)
-                if alpha <= 0.0:
+                if alpha <= 0.0 or len(pts) <= 1:
                     continue
                 color = (0, 0, int(round(200 * alpha)))
+                faded_pts = np.ascontiguousarray(np.round(pts).astype(np.int32))
                 cv2.polylines(
                     overlay,
-                    [np.array(pts, dtype=np.int32)],
+                    [faded_pts],
                     False,
                     color,
                     2,
@@ -752,9 +765,9 @@ class PlateTracker:
         return rep_segments
 
     def _find_peaks(
-        self, 
-        values: np.ndarray, 
-        prominence: float, 
+        self,
+        values: np.ndarray,
+        prominence: float,
         is_max: bool = True,
         min_distance: int = 30
     ) -> List[int]:
@@ -803,8 +816,37 @@ class PlateTracker:
                 # Keep the higher peak
                 if signal[peak_idx] > signal[filtered_peaks[-1]]:
                     filtered_peaks[-1] = peak_idx
-        
+
         return filtered_peaks
+
+    @staticmethod
+    def _smooth_polyline(
+        points: Sequence[tuple[float, float]],
+        window: int = 5,
+    ) -> np.ndarray:
+        """Apply a simple moving average to a sequence of 2D points."""
+
+        if not points:
+            return np.empty((0, 2), dtype=np.float32)
+
+        pts = np.asarray(points, dtype=np.float32)
+        if pts.shape[0] <= 2 or window <= 1:
+            return pts
+
+        window = max(int(window), 3)
+        window = min(window, pts.shape[0])
+        if window % 2 == 0:
+            window = max(3, window - 1)
+        if window <= 1:
+            return pts
+
+        pad = window // 2
+        padded = np.pad(pts, ((pad, pad), (0, 0)), mode="edge")
+        kernel = np.ones(window, dtype=np.float32) / float(window)
+        smoothed_x = np.convolve(padded[:, 0], kernel, mode="valid")
+        smoothed_y = np.convolve(padded[:, 1], kernel, mode="valid")
+        smoothed = np.stack((smoothed_x, smoothed_y), axis=1)
+        return smoothed.astype(np.float32)
 
     @staticmethod
     def _moving_average(values: np.ndarray, window: int = 5) -> np.ndarray:
