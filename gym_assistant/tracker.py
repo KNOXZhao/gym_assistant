@@ -1,7 +1,9 @@
 """Video tracking pipeline using SAM 2.1 for weight plates."""
 from __future__ import annotations
 
+from bisect import bisect_right
 import csv
+import math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
@@ -23,6 +25,7 @@ class TrajectoryPoint:
     time_s: float
     x: float
     y: float
+    x_side: Optional[float] = None
 
 
 @dataclass
@@ -61,6 +64,8 @@ class PlateTracker:
             raise FileNotFoundError(f"Unable to open video: {video_path}")
         frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         fps = float(cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        if fps <= 0:
+            fps = 30.0
         cap.release()
         return frame_count, fps
 
@@ -151,17 +156,141 @@ class PlateTracker:
         )
         return predictor, state
 
-    def _mask_to_center(self, mask_np: np.ndarray) -> tuple[float, float] | None:
-        if mask_np.dtype != np.bool_:
-            mask_np = mask_np > 0.5
+    def _extract_plate_region(
+        self,
+        mask_np: np.ndarray,
+        reference_center: tuple[float, float] | None = None,
+    ) -> tuple[np.ndarray, tuple[float, float]] | None:
+        """Select the plate region from a SAM mask.
+
+        The raw SAM mask occasionally includes parts of the barbell. We refine the
+        mask by (a) trimming pixels that extend far from the expected plate center
+        and (b) selecting the most plate-like connected component. This keeps the
+        circular plate while discarding elongated regions along the bar.
+        """
+
         if mask_np.ndim != 2:
             return None
-        ys, xs = np.nonzero(mask_np)
-        if len(xs) == 0:
+
+        mask_bool = mask_np.astype(np.float32) > 0.5
+        if not np.any(mask_bool):
             return None
-        cx = float(xs.mean())
-        cy = float(ys.mean())
-        return cx, cy
+
+        if reference_center is not None:
+            ys, xs = np.nonzero(mask_bool)
+            distances = np.hypot(xs - reference_center[0], ys - reference_center[1])
+            if len(distances) == 0:
+                return None
+            median_dist = float(np.median(distances))
+            # Estimate radius assuming a roughly circular plate.
+            radius_est = max(median_dist * 1.4142, 1.0)
+            radius_limit = radius_est * 1.2
+            keep = distances <= radius_limit
+            trimmed_mask = np.zeros_like(mask_bool)
+            trimmed_mask[ys[keep], xs[keep]] = True
+            # Only accept the trimmed mask if it preserves a substantial area.
+            if np.count_nonzero(trimmed_mask) >= max(50, int(np.count_nonzero(mask_bool) * 0.25)):
+                mask_bool = trimmed_mask
+
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        closed = cv2.morphologyEx(mask_bool.astype(np.uint8), cv2.MORPH_CLOSE, kernel)
+        if np.count_nonzero(closed) > 0:
+            mask_uint8 = closed
+        else:
+            mask_uint8 = mask_bool.astype(np.uint8)
+
+        num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+            mask_uint8, connectivity=8
+        )
+
+        if num_labels <= 1:
+            final_mask = mask_uint8.astype(bool)
+        else:
+            best_label = None
+            best_score = -np.inf
+            for label in range(1, num_labels):
+                area = stats[label, cv2.CC_STAT_AREA]
+                if area < 30:
+                    continue
+                width = stats[label, cv2.CC_STAT_WIDTH]
+                height = stats[label, cv2.CC_STAT_HEIGHT]
+                if width <= 0 or height <= 0:
+                    continue
+                aspect_ratio = max(width, height) / max(1, min(width, height))
+                extent = area / float(width * height)
+                circularity_penalty = abs(np.log(aspect_ratio + 1e-6))
+                distance_penalty = 0.0
+                if reference_center is not None:
+                    centroid_x, centroid_y = centroids[label]
+                    distance = float(
+                        np.hypot(centroid_x - reference_center[0], centroid_y - reference_center[1])
+                    )
+                    distance_penalty = distance / max(max(width, height), 1.0)
+                score = area * (extent ** 0.5)
+                score /= 1.0 + 0.5 * circularity_penalty + 0.3 * distance_penalty
+                if score > best_score:
+                    best_score = score
+                    best_label = label
+
+            if best_label is None:
+                final_mask = mask_uint8.astype(bool)
+            else:
+                final_mask = labels == best_label
+
+        ys_final, xs_final = np.nonzero(final_mask)
+        if len(xs_final) == 0:
+            return None
+
+        cx = float(xs_final.mean())
+        cy = float(ys_final.mean())
+        return final_mask.astype(bool), (cx, cy)
+
+    def _estimate_camera_angle(self, mask_bool: np.ndarray) -> Optional[float]:
+        """Estimate camera yaw angle from the apparent ellipse of the plate mask.
+
+        The camera is assumed to rotate around the vertical axis relative to a
+        true side-on view. A circular plate therefore appears as an ellipse.
+        The ratio between the minor and major axes of this ellipse is
+        cos(theta), where theta is the yaw angle. Returns the angle in radians
+        when it can be estimated reliably.
+        """
+
+        if mask_bool.dtype != bool:
+            mask_bool = mask_bool.astype(bool)
+
+        ys, xs = np.nonzero(mask_bool)
+        if xs.size < 5:
+            return None
+
+        points = np.column_stack((xs, ys)).astype(np.float32)
+        try:
+            ellipse = cv2.fitEllipse(points)
+        except cv2.error:
+            return None
+
+        (_, _), axes, _ = ellipse
+        if axes[0] <= 0 or axes[1] <= 0:
+            return None
+
+        major = max(axes)
+        minor = min(axes)
+        if major <= 0:
+            return None
+
+        ratio = float(minor / major)
+        ratio = float(np.clip(ratio, 0.01, 1.0))
+        return math.acos(ratio)
+
+    def _mask_to_center(
+        self,
+        mask_np: np.ndarray,
+        reference_center: tuple[float, float] | None = None,
+    ) -> tuple[float, float] | None:
+        result = self._extract_plate_region(mask_np, reference_center=reference_center)
+        if result is None:
+            return None
+        _, center = result
+        return center
 
     def save_mask_preview(
         self,
@@ -198,15 +327,20 @@ class PlateTracker:
             return None
 
         mask_np = np.squeeze(mask_np)
-        center = self._mask_to_center(mask_np)
+        result = self._extract_plate_region(
+            mask_np, reference_center=candidate.center
+        )
+        if result is None:
+            return None
+        mask_bool, center = result
         if center is None:
             return None
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         frame = self.load_first_frame(video_path)
-        mask_bool = (mask_np > 0.5).astype(np.uint8)
+        mask_uint8 = mask_bool.astype(np.uint8)
         mask_color = np.zeros_like(frame)
-        mask_color[:, :, 2] = mask_bool * 255
+        mask_color[:, :, 2] = mask_uint8 * 255
         preview = cv2.addWeighted(frame, 1.0, mask_color, 0.4, 0)
         cv2.circle(preview, (int(round(center[0])), int(round(center[1]))), 8, (0, 255, 255), -1)
         cv2.imwrite(str(output_path), preview)
@@ -241,9 +375,14 @@ class PlateTracker:
         output_dir_path.mkdir(parents=True, exist_ok=True)
         csv_path = output_dir_path / "trajectory.csv"
 
+        last_center: tuple[float, float] | None = candidate.center
+        first_center: tuple[float, float] | None = None
+        angle_samples: List[float] = []
+        cos_angle = 1.0
+
         with open(csv_path, "w", newline="", encoding="utf-8") as csv_file:
             writer = csv.writer(csv_file)
-            writer.writerow(["frame_idx", "time_s", "x", "y"])
+            writer.writerow(["frame_idx", "time_s", "x", "y", "x_side"])
             for frame_idx_out, obj_ids, masks in predictor.propagate_in_video(state):
                 if obj_idx is None:
                     obj_idx = obj_ids.index(obj_id)
@@ -253,17 +392,62 @@ class PlateTracker:
                 else:
                     mask_np = np.asarray(frame_mask)
                 mask_np = np.squeeze(mask_np)
-                center = self._mask_to_center(mask_np)
+                result = self._extract_plate_region(mask_np, reference_center=last_center)
+                if result is None:
+                    continue
+                mask_bool, center = result
                 if center is None:
                     continue
+                last_center = center
+                if first_center is None:
+                    first_center = center
+
+                angle_est = self._estimate_camera_angle(mask_bool)
+                if angle_est is not None:
+                    angle_samples.append(angle_est)
+                    median_angle = float(np.median(angle_samples))
+                    cos_angle = math.cos(median_angle)
+                    cos_angle = float(np.clip(cos_angle, 0.1, 1.0))
+
+                if first_center is not None:
+                    delta_x = center[0] - first_center[0]
+                    side_x = first_center[0] + delta_x / cos_angle
+                else:
+                    side_x = center[0]
                 cx, cy = center
                 time_s = frame_idx_out / fps
-                point = TrajectoryPoint(frame_idx=frame_idx_out, time_s=time_s, x=cx, y=cy)
+                point = TrajectoryPoint(
+                    frame_idx=frame_idx_out,
+                    time_s=time_s,
+                    x=cx,
+                    y=cy,
+                    x_side=side_x,
+                )
                 trajectory.append(point)
-                writer.writerow([frame_idx_out, f"{time_s:.6f}", f"{cx:.2f}", f"{cy:.2f}"])
+                writer.writerow(
+                    [
+                        frame_idx_out,
+                        f"{time_s:.6f}",
+                        f"{cx:.2f}",
+                        f"{cy:.2f}",
+                        f"{side_x:.2f}",
+                    ]
+                )
 
         rep_segments = self._segment_repetitions(trajectory)
-        self._export_visualizations(video_path, trajectory, rep_segments, output_dir_path)
+        side_angle_deg: Optional[float] = None
+        if angle_samples:
+            side_angle_deg = math.degrees(float(np.median(angle_samples)))
+            angle_path = output_dir_path / "camera_angle_degrees.txt"
+            angle_path.write_text(f"{side_angle_deg:.2f}\n", encoding="utf-8")
+
+        self._export_visualizations(
+            video_path,
+            trajectory,
+            rep_segments,
+            output_dir_path,
+            side_angle_deg=side_angle_deg,
+        )
         return trajectory, rep_segments
 
     def _export_visualizations(
@@ -272,6 +456,8 @@ class PlateTracker:
         trajectory: Sequence[TrajectoryPoint],
         rep_segments: Sequence[RepSegment],
         output_dir: Path,
+        *,
+        side_angle_deg: Optional[float] = None,
     ) -> None:
         if not trajectory:
             return
@@ -287,7 +473,8 @@ class PlateTracker:
         video_out_path = output_dir / f"trajectory_overlay{suffix}"
         writer = cv2.VideoWriter(str(video_out_path), fourcc, fps, (width, height))
 
-        rep_points: List[List[Tuple[int, int]]] = []
+        rep_points: List[np.ndarray] = []
+        rep_frames: List[List[int]] = []
         rep_frame_bounds: List[Tuple[int, int]] = []
 
         if not rep_segments:
@@ -300,10 +487,19 @@ class PlateTracker:
                 )
             ]
 
+        smoothing_window = max(3, int(round(fps * 0.1)))
+
         for segment in rep_segments:
-            pts = [(int(round(p.x)), int(round(p.y))) for p in segment.points]
-            rep_points.append(pts)
             rep_frame_bounds.append((segment.start_frame, segment.end_frame))
+            if not segment.points:
+                rep_points.append(np.empty((0, 2), dtype=np.float32))
+                rep_frames.append([])
+                continue
+
+            raw_pts = [(float(p.x), float(p.y)) for p in segment.points]
+            smoothed = self._smooth_polyline(raw_pts, window=smoothing_window)
+            rep_points.append(smoothed)
+            rep_frames.append([p.frame_idx for p in segment.points])
 
         frame_idx = 0
         fade_frames = max(15, int(round(fps * 0.5)))
@@ -322,23 +518,24 @@ class PlateTracker:
 
             for idx, segment in enumerate(rep_segments):
                 pts = rep_points[idx]
-                if not pts:
+                frames = rep_frames[idx]
+                if pts.size == 0 or not frames:
                     continue
                 start_f, end_f = rep_frame_bounds[idx]
 
                 if frame_idx < start_f:
                     continue
 
+                valid_len = bisect_right(frames, frame_idx)
+
                 if current_rep == idx:
-                    active_pts = [
-                        (int(round(p.x)), int(round(p.y)))
-                        for p in segment.points
-                        if p.frame_idx <= frame_idx
-                    ]
-                    if len(active_pts) > 1:
+                    if valid_len > 1:
+                        active_pts = np.ascontiguousarray(
+                            np.round(pts[:valid_len]).astype(np.int32)
+                        )
                         cv2.polylines(
                             overlay,
-                            [np.array(active_pts, dtype=np.int32)],
+                            [active_pts],
                             False,
                             (0, 0, 255),
                             2,
@@ -346,15 +543,13 @@ class PlateTracker:
                     continue
 
                 if frame_idx <= end_f:
-                    partial_pts = [
-                        (int(round(p.x)), int(round(p.y)))
-                        for p in segment.points
-                        if p.frame_idx <= frame_idx
-                    ]
-                    if len(partial_pts) > 1:
+                    if valid_len > 1:
+                        partial_pts = np.ascontiguousarray(
+                            np.round(pts[:valid_len]).astype(np.int32)
+                        )
                         cv2.polylines(
                             overlay,
-                            [np.array(partial_pts, dtype=np.int32)],
+                            [partial_pts],
                             False,
                             (0, 0, 200),
                             2,
@@ -363,12 +558,13 @@ class PlateTracker:
 
                 frames_since_end = frame_idx - end_f
                 alpha = max(0.0, 1.0 - frames_since_end / fade_frames)
-                if alpha <= 0.0:
+                if alpha <= 0.0 or len(pts) <= 1:
                     continue
                 color = (0, 0, int(round(200 * alpha)))
+                faded_pts = np.ascontiguousarray(np.round(pts).astype(np.int32))
                 cv2.polylines(
                     overlay,
-                    [np.array(pts, dtype=np.int32)],
+                    [faded_pts],
                     False,
                     color,
                     2,
@@ -390,9 +586,15 @@ class PlateTracker:
         cap.release()
         writer.release()
 
-        self._export_rep_plots(rep_segments, output_dir)
+        self._export_rep_plots(rep_segments, output_dir, side_angle_deg=side_angle_deg)
 
-    def _export_rep_plots(self, rep_segments: Sequence[RepSegment], output_dir: Path) -> None:
+    def _export_rep_plots(
+        self,
+        rep_segments: Sequence[RepSegment],
+        output_dir: Path,
+        *,
+        side_angle_deg: Optional[float] = None,
+    ) -> None:
         try:
             import matplotlib.pyplot as plt
         except Exception:
@@ -404,7 +606,7 @@ class PlateTracker:
         for segment in rep_segments:
             if not segment.points:
                 continue
-            xs = [p.x for p in segment.points]
+            xs = [p.x_side if p.x_side is not None else p.x for p in segment.points]
             ys = [p.y for p in segment.points]
             times = [p.time_s for p in segment.points]
             plot_path = output_dir / f"trajectory_plot_rep_{segment.index + 1}.png"
@@ -413,10 +615,16 @@ class PlateTracker:
             ax_path.plot(xs, ys, color="tab:red", linewidth=2)
             ax_path.scatter(xs[0], ys[0], color="tab:green", label="start")
             ax_path.scatter(xs[-1], ys[-1], color="tab:red", label="end")
-            ax_path.set_title(f"Rep {segment.index + 1} path")
-            ax_path.set_xlabel("X (px)")
+            if side_angle_deg is not None:
+                ax_path.set_title(
+                    f"Rep {segment.index + 1} side path (angle {side_angle_deg:.1f}°)"
+                )
+            else:
+                ax_path.set_title(f"Rep {segment.index + 1} path")
+            ax_path.set_xlabel("Side-view X (px)")
             ax_path.set_ylabel("Y (px)")
             ax_path.invert_yaxis()
+            ax_path.set_aspect("equal", adjustable="box")
             ax_path.legend(loc="best")
 
             ax_height.plot(times, ys, color="tab:blue", linewidth=2)
@@ -557,9 +765,9 @@ class PlateTracker:
         return rep_segments
 
     def _find_peaks(
-        self, 
-        values: np.ndarray, 
-        prominence: float, 
+        self,
+        values: np.ndarray,
+        prominence: float,
         is_max: bool = True,
         min_distance: int = 30
     ) -> List[int]:
@@ -608,8 +816,37 @@ class PlateTracker:
                 # Keep the higher peak
                 if signal[peak_idx] > signal[filtered_peaks[-1]]:
                     filtered_peaks[-1] = peak_idx
-        
+
         return filtered_peaks
+
+    @staticmethod
+    def _smooth_polyline(
+        points: Sequence[tuple[float, float]],
+        window: int = 5,
+    ) -> np.ndarray:
+        """Apply a simple moving average to a sequence of 2D points."""
+
+        if not points:
+            return np.empty((0, 2), dtype=np.float32)
+
+        pts = np.asarray(points, dtype=np.float32)
+        if pts.shape[0] <= 2 or window <= 1:
+            return pts
+
+        window = max(int(window), 3)
+        window = min(window, pts.shape[0])
+        if window % 2 == 0:
+            window = max(3, window - 1)
+        if window <= 1:
+            return pts
+
+        pad = window // 2
+        padded = np.pad(pts, ((pad, pad), (0, 0)), mode="edge")
+        kernel = np.ones(window, dtype=np.float32) / float(window)
+        smoothed_x = np.convolve(padded[:, 0], kernel, mode="valid")
+        smoothed_y = np.convolve(padded[:, 1], kernel, mode="valid")
+        smoothed = np.stack((smoothed_x, smoothed_y), axis=1)
+        return smoothed.astype(np.float32)
 
     @staticmethod
     def _moving_average(values: np.ndarray, window: int = 5) -> np.ndarray:
@@ -623,5 +860,13 @@ class PlateTracker:
         return smoothed.astype(np.float32)
 
 def trajectory_to_array(trajectory: Iterable[TrajectoryPoint]) -> np.ndarray:
-    data = [(p.frame_idx, p.time_s, p.x, p.y) for p in trajectory]
+    data = [
+        (
+            p.frame_idx,
+            p.time_s,
+            p.x_side if p.x_side is not None else p.x,
+            p.y,
+        )
+        for p in trajectory
+    ]
     return np.array(data, dtype=np.float32)
